@@ -188,6 +188,8 @@ impl MintBuilder {
             method: method.clone(),
         };
 
+        let max_order = ln_backend.max_order(&unit).await;
+
         tracing::debug!("Adding ln backed for {}, {}", unit, method);
         tracing::debug!("with limits {:?}", limits);
 
@@ -241,7 +243,7 @@ impl MintBuilder {
 
         let mut supported_units = self.supported_units.clone();
 
-        supported_units.insert(ln_key.unit, (0, 32));
+        supported_units.insert(ln_key.unit, (0, max_order));
         self.supported_units = supported_units;
 
         self.ln = Some(ln);
