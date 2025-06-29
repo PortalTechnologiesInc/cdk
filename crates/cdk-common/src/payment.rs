@@ -118,6 +118,11 @@ pub trait MintPayment {
         &self,
         request_lookup_id: &str,
     ) -> Result<MakePaymentResponse, Self::Err>;
+
+    /// Max order for this mint
+    async fn max_order(&self, _unit: &CurrencyUnit) -> u8 {
+        32
+    }
 }
 
 /// Create incoming payment response
