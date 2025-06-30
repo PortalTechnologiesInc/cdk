@@ -6,6 +6,7 @@ use crate::config::Auth;
 
 pub const ENV_AUTH_OPENID_DISCOVERY: &str = "CDK_MINTD_AUTH_OPENID_DISCOVERY";
 pub const ENV_AUTH_OPENID_CLIENT_ID: &str = "CDK_MINTD_AUTH_OPENID_CLIENT_ID";
+pub const ENV_AUTH_STATIC_TOKEN: &str = "CDK_MINTD_AUTH_STATIC_TOKEN";
 pub const ENV_AUTH_MINT_MAX_BAT: &str = "CDK_MINTD_AUTH_MINT_MAX_BAT";
 pub const ENV_AUTH_ENABLED_MINT: &str = "CDK_MINTD_AUTH_ENABLED_MINT";
 pub const ENV_AUTH_ENABLED_MELT: &str = "CDK_MINTD_AUTH_ENABLED_MELT";
@@ -18,11 +19,15 @@ pub const ENV_AUTH_ENABLED_CHECK_PROOF_STATE: &str = "CDK_MINTD_AUTH_ENABLED_CHE
 impl Auth {
     pub fn from_env(mut self) -> Self {
         if let Ok(discovery) = env::var(ENV_AUTH_OPENID_DISCOVERY) {
-            self.openid_discovery = discovery;
+            self.openid_discovery = Some(discovery);
         }
 
         if let Ok(client_id) = env::var(ENV_AUTH_OPENID_CLIENT_ID) {
-            self.openid_client_id = client_id;
+            self.openid_client_id = Some(client_id);
+        }
+
+        if let Ok(static_token) = env::var(ENV_AUTH_STATIC_TOKEN) {
+            self.static_token = Some(static_token);
         }
 
         if let Ok(max_bat_str) = env::var(ENV_AUTH_MINT_MAX_BAT) {

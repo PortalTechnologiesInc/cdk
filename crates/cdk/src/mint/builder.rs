@@ -50,6 +50,8 @@ pub struct MintBuilder {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     // protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
     openid_discovery: Option<String>,
+    #[cfg(feature = "auth")]
+    static_token: Option<String>,
     signatory: Option<Arc<dyn Signatory + Sync + Send + 'static>>,
 }
 
@@ -116,6 +118,13 @@ impl MintBuilder {
     /// Set Openid discovery url
     pub fn with_openid_discovery(mut self, openid_discovery: String) -> Self {
         self.openid_discovery = Some(openid_discovery);
+        self
+    }
+
+    /// Set static token for authentication
+    #[cfg(feature = "auth")]
+    pub fn with_static_token(mut self, static_token: String) -> Self {
+        self.static_token = Some(static_token);
         self
     }
 
@@ -360,7 +369,7 @@ impl MintBuilder {
         };
 
         #[cfg(feature = "auth")]
-        if let Some(openid_discovery) = &self.openid_discovery {
+        if self.openid_discovery.is_some() || self.static_token.is_some() {
             let auth_localstore = self
                 .auth_localstore
                 .clone()
@@ -371,7 +380,8 @@ impl MintBuilder {
                 localstore,
                 auth_localstore,
                 ln,
-                openid_discovery.clone(),
+                self.openid_discovery.clone(),
+                self.static_token.clone(),
             )
             .await?);
         }
