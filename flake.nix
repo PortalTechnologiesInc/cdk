@@ -138,17 +138,31 @@
           fileset = lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
+            (craneLib.fileset.commonCargoSources ./crates/cashu)
             (craneLib.fileset.commonCargoSources ./crates/cdk)
             (craneLib.fileset.commonCargoSources ./crates/cdk-axum)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-cli)
             (craneLib.fileset.commonCargoSources ./crates/cdk-cln)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-common)
             (craneLib.fileset.commonCargoSources ./crates/cdk-lnd)
             (craneLib.fileset.commonCargoSources ./crates/cdk-fake-wallet)
             (craneLib.fileset.commonCargoSources ./crates/cdk-lnbits)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-mint-rpc)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-payment-processor)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-portal-wallet)
             (craneLib.fileset.commonCargoSources ./crates/cdk-redb)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-rexie)
+            (craneLib.fileset.commonCargoSources ./crates/cdk-signatory)
             (craneLib.fileset.commonCargoSources ./crates/cdk-sqlite)
             ./crates/cdk-sqlite/src/mint/migrations
+            ./crates/cdk-sqlite/src/mint/auth/migrations
             ./crates/cdk-sqlite/src/wallet/migrations
             (craneLib.fileset.commonCargoSources crate)
+
+            (lib.fileset.fileFilter
+              (file:
+                file.name == "README.md" || lib.hasSuffix ".proto" file.name)
+              ./.)
           ];
         };
 
