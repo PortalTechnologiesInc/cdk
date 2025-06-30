@@ -1,13 +1,13 @@
-#[cfg(feature = "fakewallet")]
+#[cfg(any(feature = "fakewallet", feature = "portalwallet"))]
 use std::collections::HashMap;
-#[cfg(feature = "fakewallet")]
+#[cfg(any(feature = "fakewallet", feature = "portalwallet"))]
 use std::collections::HashSet;
 
 #[cfg(feature = "cln")]
 use anyhow::anyhow;
 use async_trait::async_trait;
 use axum::Router;
-#[cfg(feature = "fakewallet")]
+#[cfg(any(feature = "fakewallet", feature = "portalwallet"))]
 use bip39::rand::{thread_rng, Rng};
 use cdk::cdk_payment::MintPayment;
 #[cfg(feature = "lnbits")]
@@ -17,7 +17,8 @@ use cdk::nuts::CurrencyUnit;
     feature = "lnbits",
     feature = "cln",
     feature = "lnd",
-    feature = "fakewallet"
+    feature = "fakewallet",
+    feature = "portalwallet"
 ))]
 use cdk::types::FeeReserve;
 
@@ -180,6 +181,22 @@ impl LnBackendSetup for config::FakeWallet {
         );
 
         Ok(fake_wallet)
+    }
+}
+
+#[cfg(feature = "portalwallet")]
+#[async_trait]
+impl LnBackendSetup for config::PortalWallet {
+    async fn setup(
+        &self,
+        _router: &mut Vec<Router>,
+        _settings: &Settings,
+        _unit: CurrencyUnit,
+    ) -> anyhow::Result<cdk_portal_wallet::PortalWallet> {
+        let portal_wallet =
+            cdk_portal_wallet::PortalWallet::new(HashMap::default(), HashSet::default());
+
+        Ok(portal_wallet)
     }
 }
 
