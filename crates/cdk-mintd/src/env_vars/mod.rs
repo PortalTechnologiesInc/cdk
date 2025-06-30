@@ -22,6 +22,8 @@ mod lnbits;
 mod lnd;
 #[cfg(feature = "management-rpc")]
 mod management_rpc;
+#[cfg(feature = "portalwallet")]
+mod portal_wallet;
 
 use std::env;
 use std::str::FromStr;
@@ -44,6 +46,8 @@ pub use lnd::*;
 #[cfg(feature = "management-rpc")]
 pub use management_rpc::*;
 pub use mint_info::*;
+#[cfg(feature = "portalwallet")]
+pub use portal_wallet::*;
 
 use crate::config::{Database, DatabaseEngine, LnBackend, Settings};
 
@@ -99,6 +103,15 @@ impl Settings {
             #[cfg(feature = "fakewallet")]
             LnBackend::FakeWallet => {
                 self.fake_wallet = Some(self.fake_wallet.clone().unwrap_or_default().from_env());
+            }
+            #[cfg(feature = "portalwallet")]
+            LnBackend::PortalWallet => {
+                self.portal_wallet = Some(
+                    self.portal_wallet
+                        .clone()
+                        .expect("Portal wallet configuration must be set")
+                        .from_env(),
+                );
             }
             #[cfg(feature = "lnd")]
             LnBackend::Lnd => {

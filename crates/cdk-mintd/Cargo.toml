@@ -11,13 +11,14 @@ rust-version.workspace = true
 readme = "README.md"
 
 [features]
-default = ["management-rpc", "cln", "lnd", "lnbits", "fakewallet", "grpc-processor", "auth"]
+default = ["management-rpc", "cln", "lnd", "lnbits", "fakewallet", "grpc-processor", "auth", "portalwallet"]
 # Ensure at least one lightning backend is enabled
 management-rpc = ["cdk-mint-rpc"]
 cln = ["dep:cdk-cln"]
 lnd = ["dep:cdk-lnd"]
 lnbits = ["dep:cdk-lnbits"]
 fakewallet = ["dep:cdk-fake-wallet"]
+portalwallet = ["dep:cdk-portal-wallet"]
 grpc-processor = ["dep:cdk-payment-processor", "cdk-signatory/grpc"]
 sqlcipher = ["cdk-sqlite/sqlcipher"]
 # MSRV is not committed to with swagger enabled
@@ -39,6 +40,7 @@ cdk-cln = { workspace = true, optional = true }
 cdk-lnbits = { workspace = true, optional = true }
 cdk-lnd = { workspace = true, optional = true }
 cdk-fake-wallet = { workspace = true, optional = true }
+cdk-portal-wallet = { workspace = true, optional = true }
 cdk-axum.workspace = true
 cdk-signatory.workspace = true
 cdk-mint-rpc = { workspace = true, optional = true }
