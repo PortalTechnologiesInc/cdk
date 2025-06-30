@@ -1,3 +1,5 @@
+#[cfg(feature = "portalwallet")]
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bitcoin::hashes::{sha256, Hash};
@@ -61,6 +63,8 @@ pub enum LnBackend {
     LNbits,
     #[cfg(feature = "fakewallet")]
     FakeWallet,
+    #[cfg(feature = "portalwallet")]
+    PortalWallet,
     #[cfg(feature = "lnd")]
     Lnd,
     #[cfg(feature = "grpc-processor")]
@@ -78,6 +82,8 @@ impl std::str::FromStr for LnBackend {
             "lnbits" => Ok(LnBackend::LNbits),
             #[cfg(feature = "fakewallet")]
             "fakewallet" => Ok(LnBackend::FakeWallet),
+            #[cfg(feature = "portalwallet")]
+            "portalwallet" => Ok(LnBackend::PortalWallet),
             #[cfg(feature = "lnd")]
             "lnd" => Ok(LnBackend::Lnd),
             #[cfg(feature = "grpc-processor")]
@@ -177,6 +183,12 @@ fn default_max_delay_time() -> u64 {
     3
 }
 
+#[cfg(feature = "portalwallet")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortalWallet {
+    pub supported_units: HashMap<CurrencyUnit, u8>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct GrpcProcessor {
     pub supported_units: Vec<CurrencyUnit>,
@@ -246,6 +258,8 @@ pub struct Settings {
     pub lnd: Option<Lnd>,
     #[cfg(feature = "fakewallet")]
     pub fake_wallet: Option<FakeWallet>,
+    #[cfg(feature = "portalwallet")]
+    pub portal_wallet: Option<PortalWallet>,
     pub grpc_processor: Option<GrpcProcessor>,
     pub database: Database,
     #[cfg(feature = "management-rpc")]
@@ -354,6 +368,11 @@ impl Settings {
             LnBackend::FakeWallet => assert!(
                 settings.fake_wallet.is_some(),
                 "FakeWallet backend requires a valid config."
+            ),
+            #[cfg(feature = "portalwallet")]
+            LnBackend::PortalWallet => assert!(
+                settings.portal_wallet.is_some(),
+                "PortalWallet backend requires a valid config."
             ),
             #[cfg(feature = "grpc-processor")]
             LnBackend::GrpcProcessor => {

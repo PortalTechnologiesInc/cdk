@@ -25,6 +25,7 @@ use cdk::mint::{MintBuilder, MintMeltLimits};
     feature = "lnbits",
     feature = "lnd",
     feature = "fakewallet",
+    feature = "portalwallet",
     feature = "grpc-processor"
 ))]
 use cdk::nuts::nut17::SupportedMethods;
@@ -33,7 +34,8 @@ use cdk::nuts::nut19::{CachedEndpoint, Method as NUT19Method, Path as NUT19Path}
     feature = "cln",
     feature = "lnbits",
     feature = "lnd",
-    feature = "fakewallet"
+    feature = "fakewallet",
+    feature = "portalwallet"
 ))]
 use cdk::nuts::CurrencyUnit;
 #[cfg(feature = "auth")]
@@ -66,10 +68,11 @@ const CARGO_PKG_VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION")
     feature = "lnbits",
     feature = "lnd",
     feature = "fakewallet",
+    feature = "portalwallet",
     feature = "grpc-processor"
 )))]
 compile_error!(
-    "At least one lightning backend feature must be enabled: cln, lnbits, lnd, fakewallet, or grpc-processor"
+    "At least one lightning backend feature must be enabled: cln, lnbits, lnd, fakewallet, portalwallet, or grpc-processor"
 );
 
 /// The main entry point for the application.
@@ -380,6 +383,41 @@ async fn configure_lightning_backend(
                     Arc::new(fake),
                 )
                 .await?;
+            }
+        }
+        #[cfg(feature = "portalwallet")]
+        LnBackend::PortalWallet => {
+            let portal_wallet = settings
+                .clone()
+                .portal_wallet
+                .expect("Portal wallet defined");
+            tracing::info!("Using portal wallet: {:?}", portal_wallet);
+
+            for (unit, max_order) in portal_wallet.clone().supported_units {
+                let portal = portal_wallet
+                    .setup(&mut ln_routers, &settings, CurrencyUnit::Sat)
+                    .await
+                    .expect("hhh");
+
+                portal.add_supported_unit(unit.clone(), max_order).await;
+
+                let portal = Arc::new(portal);
+
+                mint_builder = mint_builder
+                    .add_ln_backend(
+                        unit.clone(),
+                        PaymentMethod::Bolt11,
+                        mint_melt_limits,
+                        portal.clone(),
+                    )
+                    .await?;
+                if let Some(input_fee) = settings.info.input_fee_ppk {
+                    mint_builder = mint_builder.set_unit_fee(&unit, input_fee)?;
+                }
+
+                let nut17_supported = SupportedMethods::default_bolt11(unit);
+
+                mint_builder = mint_builder.add_supported_websockets(nut17_supported);
             }
         }
         #[cfg(feature = "grpc-processor")]
