@@ -28,216 +28,217 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils, pre-commit-hooks, crane, fenix, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        overlays = [ (import rust-overlay) ];
-        lib = pkgs.lib;
-        stdenv = pkgs.stdenv;
-        isDarwin = stdenv.isDarwin;
-        libsDarwin = with pkgs; lib.optionals isDarwin [
-          # Additional darwin specific inputs can be set here
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-        ];
-
-        # Dependencies
-        pkgs = import nixpkgs {
-          inherit system overlays;
-        };
-
-
-
-        # Toolchains
-        # latest stable
-        stable_toolchain = pkgs.rust-bin.stable."1.86.0".default.override {
-          targets = [ "wasm32-unknown-unknown" ]; # wasm
-          extensions = [ "rustfmt" "clippy" "rust-analyzer" ];
-        };
-
-        # MSRV stable
-        msrv_toolchain = pkgs.rust-bin.stable."1.75.0".default.override {
-          targets = [ "wasm32-unknown-unknown" ]; # wasm
-        };
-
-        # Nightly used for formatting
-        nightly_toolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-          extensions = [ "rustfmt" "clippy" "rust-analyzer" "rust-src" ];
-          targets = [ "wasm32-unknown-unknown" ]; # wasm
-        });
-
-        # Common inputs
-        envVars = { };
-        buildInputs = with pkgs; [
-          # Add additional build inputs here
-          git
-          pkg-config
-          curl
-          just
-          protobuf
-          nixpkgs-fmt
-          typos
-          lnd
-          clightning
-          bitcoind
-          sqlx-cli
-          cargo-outdated
-
-          # Needed for github ci
-          libz
-        ] ++ libsDarwin;
-
-        # WASM deps
-        WASMInputs = with pkgs; [
-        ];
-
-
-
-        craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
-
-        # Common arguments can be set here to avoid repeating them later
-        commonArgs = {
-          inherit src;
-          strictDeps = true;
-
-          buildInputs = [
-            # Add additional build inputs here
-            pkgs.protobuf
-            pkgs.pkg-config
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+    flake-utils.lib.eachDefaultSystem
+      (system:
+        let
+          overlays = [ (import rust-overlay) ];
+          lib = pkgs.lib;
+          stdenv = pkgs.stdenv;
+          isDarwin = stdenv.isDarwin;
+          libsDarwin = with pkgs; lib.optionals isDarwin [
             # Additional darwin specific inputs can be set here
-            pkgs.libiconv
+            darwin.apple_sdk.frameworks.Security
+            darwin.apple_sdk.frameworks.SystemConfiguration
           ];
 
-          # Additional environment variables can be set directly
-          # MY_CUSTOM_VAR = "some value";
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
-          PROTOC_INCLUDE = "${pkgs.protobuf}/include";
-        };
-
-
-        craneLibLLvmTools = craneLib.overrideToolchain
-          (fenix.packages.${system}.complete.withComponents [
-            "cargo"
-            "llvm-tools"
-            "rustc"
-          ]);
-
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-        individualCrateArgs = commonArgs // {
-          inherit cargoArtifacts;
-          inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
-          # NB: we disable tests since we'll run them all via cargo-nextest
-          doCheck = false;
-        };
-
-        fileSetForCrate = crate: lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            ./Cargo.toml
-            ./Cargo.lock
-            (craneLib.fileset.commonCargoSources ./crates/cashu)
-            (craneLib.fileset.commonCargoSources ./crates/cdk)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-axum)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-cli)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-cln)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-common)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-lnd)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-fake-wallet)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-lnbits)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-mint-rpc)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-payment-processor)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-portal-wallet)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-redb)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-rexie)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-signatory)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-sqlite)
-            ./crates/cdk-sqlite/src/mint/migrations
-            ./crates/cdk-sqlite/src/mint/auth/migrations
-            ./crates/cdk-sqlite/src/wallet/migrations
-            (craneLib.fileset.commonCargoSources crate)
-
-            (lib.fileset.fileFilter
-              (file:
-                file.name == "README.md" || lib.hasSuffix ".proto" file.name)
-              ./.)
-          ];
-        };
-
-        cdk-mintd = craneLib.buildPackage (individualCrateArgs // {
-          pname = "cdk-mintd";
-          name = "cdk-mintd-${individualCrateArgs.version}";
-          cargoExtraArgs = "-p cdk-mintd";
-          src = fileSetForCrate ./crates/cdk-mintd;
-        });
-
-
-        nativeBuildInputs = with pkgs; [
-          #Add additional build inputs here
-        ] ++ lib.optionals isDarwin [
-          # Additional darwin specific native inputs can be set here
-        ];
-      in
-      {
-        checks = {
-          # Pre-commit checks
-          pre-commit-check =
-            let
-              # this is a hack based on https://github.com/cachix/pre-commit-hooks.nix/issues/126
-              # we want to use our own rust stuff from oxalica's overlay
-              _rust = pkgs.rust-bin.stable.latest.default;
-              rust = pkgs.buildEnv {
-                name = _rust.name;
-                inherit (_rust) meta;
-                buildInputs = [ pkgs.makeWrapper ];
-                paths = [ _rust ];
-                pathsToLink = [ "/" "/bin" ];
-                postBuild = ''
-                  for i in $out/bin/*; do
-                    wrapProgram "$i" --prefix PATH : "$out/bin"
-                  done
-                '';
-              };
-            in
-            pre-commit-hooks.lib.${system}.run {
-              src = ./.;
-              hooks = {
-                rustfmt = {
-                  enable = true;
-                  entry = lib.mkForce "${rust}/bin/cargo-fmt fmt --all -- --config format_code_in_doc_comments=true --check --color always";
-                };
-                nixpkgs-fmt.enable = true;
-                typos.enable = true;
-                commitizen.enable = true; # conventional commits
-              };
-            };
-        };
-
-
-        packages = {
-          inherit cdk-mintd;
-          default = cdk-mintd;
-        } // lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
-          my-workspace-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
-            inherit cargoArtifacts;
-          });
-        };
-
-        apps = {
-          cdk-mintd = flake-utils.lib.mkApp {
-            drv = cdk-mintd;
+          # Dependencies
+          pkgs = import nixpkgs {
+            inherit system overlays;
           };
-        };
 
-        devShells =
-          let
-            # pre-commit-checks
-            _shellHook = (self.checks.${system}.pre-commit-check.shellHook or "");
 
-            # devShells
-            msrv = pkgs.mkShell ({
-              shellHook = "
+
+          # Toolchains
+          # latest stable
+          stable_toolchain = pkgs.rust-bin.stable."1.86.0".default.override {
+            targets = [ "wasm32-unknown-unknown" ]; # wasm
+            extensions = [ "rustfmt" "clippy" "rust-analyzer" ];
+          };
+
+          # MSRV stable
+          msrv_toolchain = pkgs.rust-bin.stable."1.75.0".default.override {
+            targets = [ "wasm32-unknown-unknown" ]; # wasm
+          };
+
+          # Nightly used for formatting
+          nightly_toolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
+            extensions = [ "rustfmt" "clippy" "rust-analyzer" "rust-src" ];
+            targets = [ "wasm32-unknown-unknown" ]; # wasm
+          });
+
+          # Common inputs
+          envVars = { };
+          buildInputs = with pkgs; [
+            # Add additional build inputs here
+            git
+            pkg-config
+            curl
+            just
+            protobuf
+            nixpkgs-fmt
+            typos
+            lnd
+            clightning
+            bitcoind
+            sqlx-cli
+            cargo-outdated
+
+            # Needed for github ci
+            libz
+          ] ++ libsDarwin;
+
+          # WASM deps
+          WASMInputs = with pkgs; [
+          ];
+
+
+
+          craneLib = crane.mkLib pkgs;
+          src = craneLib.cleanCargoSource ./.;
+
+          # Common arguments can be set here to avoid repeating them later
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+
+            buildInputs = [
+              # Add additional build inputs here
+              pkgs.protobuf
+              pkgs.pkg-config
+            ] ++ lib.optionals pkgs.stdenv.isDarwin [
+              # Additional darwin specific inputs can be set here
+              pkgs.libiconv
+            ];
+
+            # Additional environment variables can be set directly
+            # MY_CUSTOM_VAR = "some value";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+            PROTOC_INCLUDE = "${pkgs.protobuf}/include";
+          };
+
+
+          craneLibLLvmTools = craneLib.overrideToolchain
+            (fenix.packages.${system}.complete.withComponents [
+              "cargo"
+              "llvm-tools"
+              "rustc"
+            ]);
+
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          individualCrateArgs = commonArgs // {
+            inherit cargoArtifacts;
+            inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
+            # NB: we disable tests since we'll run them all via cargo-nextest
+            doCheck = false;
+          };
+
+          fileSetForCrate = crate: lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              (craneLib.fileset.commonCargoSources ./crates/cashu)
+              (craneLib.fileset.commonCargoSources ./crates/cdk)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-axum)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-cli)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-cln)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-common)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-lnd)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-fake-wallet)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-lnbits)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-mint-rpc)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-payment-processor)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-portal-wallet)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-redb)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-rexie)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-signatory)
+              (craneLib.fileset.commonCargoSources ./crates/cdk-sqlite)
+              ./crates/cdk-sqlite/src/mint/migrations
+              ./crates/cdk-sqlite/src/mint/auth/migrations
+              ./crates/cdk-sqlite/src/wallet/migrations
+              (craneLib.fileset.commonCargoSources crate)
+
+              (lib.fileset.fileFilter
+                (file:
+                  file.name == "README.md" || lib.hasSuffix ".proto" file.name)
+                ./.)
+            ];
+          };
+
+          cdk-mintd = craneLib.buildPackage (individualCrateArgs // {
+            pname = "cdk-mintd";
+            name = "cdk-mintd-${individualCrateArgs.version}";
+            cargoExtraArgs = "-p cdk-mintd";
+            src = fileSetForCrate ./crates/cdk-mintd;
+          });
+
+
+          nativeBuildInputs = with pkgs; [
+            #Add additional build inputs here
+          ] ++ lib.optionals isDarwin [
+            # Additional darwin specific native inputs can be set here
+          ];
+        in
+        {
+          checks = {
+            # Pre-commit checks
+            pre-commit-check =
+              let
+                # this is a hack based on https://github.com/cachix/pre-commit-hooks.nix/issues/126
+                # we want to use our own rust stuff from oxalica's overlay
+                _rust = pkgs.rust-bin.stable.latest.default;
+                rust = pkgs.buildEnv {
+                  name = _rust.name;
+                  inherit (_rust) meta;
+                  buildInputs = [ pkgs.makeWrapper ];
+                  paths = [ _rust ];
+                  pathsToLink = [ "/" "/bin" ];
+                  postBuild = ''
+                    for i in $out/bin/*; do
+                      wrapProgram "$i" --prefix PATH : "$out/bin"
+                    done
+                  '';
+                };
+              in
+              pre-commit-hooks.lib.${system}.run {
+                src = ./.;
+                hooks = {
+                  rustfmt = {
+                    enable = true;
+                    entry = lib.mkForce "${rust}/bin/cargo-fmt fmt --all -- --config format_code_in_doc_comments=true --check --color always";
+                  };
+                  nixpkgs-fmt.enable = true;
+                  typos.enable = true;
+                  commitizen.enable = true; # conventional commits
+                };
+              };
+          };
+
+
+          packages = {
+            inherit cdk-mintd;
+            default = cdk-mintd;
+          } // lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
+            my-workspace-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
+              inherit cargoArtifacts;
+            });
+          };
+
+          apps = {
+            cdk-mintd = flake-utils.lib.mkApp {
+              drv = cdk-mintd;
+            };
+          };
+
+          devShells =
+            let
+              # pre-commit-checks
+              _shellHook = (self.checks.${system}.pre-commit-check.shellHook or "");
+
+              # devShells
+              msrv = pkgs.mkShell ({
+                shellHook = "
               ${_shellHook}
               cargo update
               # cargo update -p async-compression --precise 0.4.3
@@ -251,55 +252,67 @@
               cargo update -p pest_meta --precise 2.8.0
               cargo update -p pest --precise 2.8.0
               ";
-              buildInputs = buildInputs ++ WASMInputs ++ [ msrv_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+                buildInputs = buildInputs ++ WASMInputs ++ [ msrv_toolchain ];
+                inherit nativeBuildInputs;
+              } // envVars);
 
-            stable = pkgs.mkShell ({
-              shellHook = ''${_shellHook}'';
-              buildInputs = buildInputs ++ WASMInputs ++ [ stable_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+              stable = pkgs.mkShell ({
+                shellHook = ''${_shellHook}'';
+                buildInputs = buildInputs ++ WASMInputs ++ [ stable_toolchain ];
+                inherit nativeBuildInputs;
+              } // envVars);
 
 
-            nightly = pkgs.mkShell ({
-              shellHook = ''
-                ${_shellHook}
-                # Needed for github ci
-                export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
-                  pkgs.zlib
-                  ]}:$LD_LIBRARY_PATH
-                export RUST_SRC_PATH=${nightly_toolchain}/lib/rustlib/src/rust/library
-              '';
-              buildInputs = buildInputs ++ [ nightly_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+              nightly = pkgs.mkShell ({
+                shellHook = ''
+                  ${_shellHook}
+                  # Needed for github ci
+                  export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+                    pkgs.zlib
+                    ]}:$LD_LIBRARY_PATH
+                  export RUST_SRC_PATH=${nightly_toolchain}/lib/rustlib/src/rust/library
+                '';
+                buildInputs = buildInputs ++ [ nightly_toolchain ];
+                inherit nativeBuildInputs;
+              } // envVars);
 
-            # Shell with Docker for integration tests
-            integration = pkgs.mkShell ({
-              shellHook = ''
-                ${_shellHook}
-                # Ensure Docker is available
-                if ! command -v docker &> /dev/null; then
-                  echo "Docker is not installed or not in PATH"
-                  echo "Please install Docker to run integration tests"
-                  exit 1
-                fi
-                echo "Docker is available at $(which docker)"
-                echo "Docker version: $(docker --version)"
-              '';
-              buildInputs = buildInputs ++ [
-                stable_toolchain
-                pkgs.docker-client
-              ];
-              inherit nativeBuildInputs;
-            } // envVars);
+              # Shell with Docker for integration tests
+              integration = pkgs.mkShell ({
+                shellHook = ''
+                  ${_shellHook}
+                  # Ensure Docker is available
+                  if ! command -v docker &> /dev/null; then
+                    echo "Docker is not installed or not in PATH"
+                    echo "Please install Docker to run integration tests"
+                    exit 1
+                  fi
+                  echo "Docker is available at $(which docker)"
+                  echo "Docker version: $(docker --version)"
+                '';
+                buildInputs = buildInputs ++ [
+                  stable_toolchain
+                  pkgs.docker-client
+                ];
+                inherit nativeBuildInputs;
+              } // envVars);
 
-          in
-          {
-            inherit msrv stable nightly integration;
-            default = stable;
-          };
-      }
-    );
+            in
+            {
+              inherit msrv stable nightly integration;
+              default = stable;
+            };
+        }
+      ) // {
+      overlays.default = final: prev: {
+        cdk-mintd = self.packages.${final.system}.cdk-mintd;
+      };
+
+      nixosModules = {
+        cdk-mintd = ./nixos-module.nix;
+        default = { ... }: {
+          imports = [ self.nixosModules.cdk-mintd ];
+          nixpkgs.overlays = [ self.overlays.default ];
+        };
+      };
+    };
 }
