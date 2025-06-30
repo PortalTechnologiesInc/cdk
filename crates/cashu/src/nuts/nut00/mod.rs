@@ -583,7 +583,14 @@ impl CurrencyUnit {
             Self::Usd => Some(2),
             Self::Eur => Some(3),
             Self::Auth => Some(4),
-            _ => None,
+            Self::Custom(v) => {
+                use std::hash::DefaultHasher;
+
+                let mut hasher = DefaultHasher::new();
+                v.hash(&mut hasher);
+                let h = hasher.finish();
+                Some((h as u32) & 0x7FFFFFFF)
+            }
         }
     }
 }
