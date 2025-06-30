@@ -446,10 +446,19 @@ async fn main() -> anyhow::Result<()> {
         let mint_blind_auth_endpoint =
             ProtectedEndpoint::new(cdk::nuts::Method::Post, RoutePath::MintBlindAuth);
 
-        mint_builder = mint_builder.set_clear_auth_settings(
-            auth_settings.openid_discovery,
-            auth_settings.openid_client_id,
-        );
+        // Only set clear auth settings if both OIDC fields are provided
+        if let (Some(openid_discovery), Some(openid_client_id)) = (
+            &auth_settings.openid_discovery,
+            &auth_settings.openid_client_id,
+        ) {
+            mint_builder = mint_builder
+                .set_clear_auth_settings(openid_discovery.clone(), openid_client_id.clone());
+        }
+
+        // Set static token if provided
+        if let Some(static_token) = &auth_settings.static_token {
+            mint_builder = mint_builder.with_static_token(static_token.clone());
+        }
 
         let mut protected_endpoints = HashMap::new();
 

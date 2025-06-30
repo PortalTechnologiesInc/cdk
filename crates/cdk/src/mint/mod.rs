@@ -66,6 +66,8 @@ pub struct Mint {
     pub pubsub_manager: Arc<PubSubManager>,
     #[cfg(feature = "auth")]
     oidc_client: Option<OidcClient>,
+    #[cfg(feature = "auth")]
+    static_token: Option<String>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
 }
@@ -105,6 +107,8 @@ impl Mint {
             ln,
             #[cfg(feature = "auth")]
             None,
+            #[cfg(feature = "auth")]
+            None,
         )
         .await
     }
@@ -119,14 +123,16 @@ impl Mint {
             PaymentProcessorKey,
             Arc<dyn MintPayment<Err = cdk_payment::Error> + Send + Sync>,
         >,
-        open_id_discovery: String,
+        open_id_discovery: Option<String>,
+        static_token: Option<String>,
     ) -> Result<Self, Error> {
         Self::new_internal(
             signatory,
             localstore,
             Some(auth_localstore),
             ln,
-            Some(open_id_discovery),
+            open_id_discovery,
+            static_token,
         )
         .await
     }
@@ -144,6 +150,7 @@ impl Mint {
             Arc<dyn MintPayment<Err = cdk_payment::Error> + Send + Sync>,
         >,
         #[cfg(feature = "auth")] open_id_discovery: Option<String>,
+        #[cfg(feature = "auth")] static_token: Option<String>,
     ) -> Result<Self, Error> {
         #[cfg(feature = "auth")]
         let oidc_client =
@@ -177,6 +184,8 @@ impl Mint {
             ln,
             #[cfg(feature = "auth")]
             auth_localstore,
+            #[cfg(feature = "auth")]
+            static_token,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
         })
     }

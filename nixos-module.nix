@@ -111,6 +111,13 @@ in
       description =
         "Path to file containing the mnemonic seed phrase. If specified, the mnemonic will be loaded from this file at startup.";
     };
+
+    staticTokenFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description =
+        "Path to file containing the static token. If specified, the static token will be loaded from this file at startup.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -169,6 +176,16 @@ in
             echo "Loaded mnemonic from ${cfg.mnemonicFile}"
           else
             echo "Mnemonic file ${cfg.mnemonicFile} not found"
+            exit 1
+          fi
+        ''}
+
+        ${optionalString (cfg.staticTokenFile != null) ''
+          if [ -f "${cfg.staticTokenFile}" ]; then
+            export CDK_MINTD_AUTH_STATIC_TOKEN="$(cat "${cfg.staticTokenFile}")"
+            echo "Loaded static token from ${cfg.staticTokenFile}"
+          else
+            echo "Static token file ${cfg.staticTokenFile} not found"
             exit 1
           fi
         ''}

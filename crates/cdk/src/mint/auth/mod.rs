@@ -23,6 +23,16 @@ impl Mint {
     /// Verify Clear auth
     #[instrument(skip_all, fields(token_len = token.len()))]
     pub async fn verify_clear_auth(&self, token: String) -> Result<(), Error> {
+        // Check for static token first
+        #[cfg(feature = "auth")]
+        if let Some(static_token) = &self.static_token {
+            if token == *static_token {
+                tracing::debug!("Static token authentication successful");
+                return Ok(());
+            }
+        }
+
+        // Fall back to OIDC verification
         Ok(self
             .oidc_client
             .as_ref()

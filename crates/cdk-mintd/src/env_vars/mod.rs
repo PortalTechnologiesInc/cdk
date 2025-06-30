@@ -68,8 +68,9 @@ impl Settings {
             let auth = self.auth.clone().unwrap_or_default().from_env();
 
             // Only set auth if env vars are present and have non-default values
-            if auth.openid_discovery != String::default()
-                || auth.openid_client_id != String::default()
+            if auth.openid_discovery.is_some()
+                || auth.openid_client_id.is_some()
+                || auth.static_token.is_some()
                 || auth.mint_max_bat != 0
                 || auth.enabled_mint
                 || auth.enabled_melt

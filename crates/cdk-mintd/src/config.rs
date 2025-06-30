@@ -222,8 +222,9 @@ pub struct Database {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Auth {
-    pub openid_discovery: String,
-    pub openid_client_id: String,
+    pub openid_discovery: Option<String>,
+    pub openid_client_id: Option<String>,
+    pub static_token: Option<String>,
     pub mint_max_bat: u64,
     #[serde(default = "default_true")]
     pub enabled_mint: bool,
