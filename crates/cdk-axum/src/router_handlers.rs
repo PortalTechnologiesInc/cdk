@@ -1,9 +1,12 @@
+use std::str::FromStr;
+
 use anyhow::Result;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use cdk::error::{ErrorCode, ErrorResponse};
+use cdk::mint::UnitMetadata;
 #[cfg(feature = "auth")]
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 use cdk::nuts::{
@@ -111,6 +114,38 @@ pub(crate) async fn get_keyset_pubkeys(
     })?;
 
     Ok(Json(pubkeys))
+}
+
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    context_path = "/v1",
+    path = "/unit/{unit}",
+    params(
+        ("unit" = String, description = "The unit"),
+    ),
+    responses(
+        (status = 200, description = "Successful response", body = KeysResponse, content_type = "application/json"),
+        (status = 500, description = "Server error", body = ErrorResponse, content_type = "application/json")
+    )
+))]
+/// Get the metadata of a specific keyset
+///
+/// Get the metadata of the mint from a specific keyset ID.
+#[instrument(skip_all, fields(unit = ?unit))]
+pub(crate) async fn get_unit_metadata(
+    State(state): State<MintState>,
+    Path(unit): Path<String>,
+) -> Result<Json<UnitMetadata>, Response> {
+    let unit = cdk::nuts::nut00::CurrencyUnit::from_str(&unit).map_err(|err| {
+        tracing::error!("Could not parse unit: {}", err);
+        into_response(cdk::Error::UnsupportedUnit)
+    })?;
+    let metadata = state.mint.get_unit_metadata(unit).ok_or_else(|| {
+        tracing::error!("Could not get unit metadata");
+        into_response(cdk::Error::UnsupportedUnit)
+    })?;
+
+    Ok(Json(metadata))
 }
 
 #[cfg_attr(feature = "swagger", utoipa::path(

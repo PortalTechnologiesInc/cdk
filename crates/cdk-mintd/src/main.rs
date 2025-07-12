@@ -414,6 +414,9 @@ async fn configure_lightning_backend(
                 if let Some(input_fee) = settings.info.input_fee_ppk {
                     mint_builder = mint_builder.set_unit_fee(&unit, input_fee)?;
                 }
+                if let Some(unit_metadata) = portal_wallet.unit_info.get(&unit) {
+                    mint_builder = mint_builder.set_unit_metadata(&unit, unit_metadata.clone());
+                }
 
                 let nut17_supported = SupportedMethods::default_bolt11(unit);
 

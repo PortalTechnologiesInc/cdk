@@ -43,6 +43,7 @@ mod swap;
 mod verification;
 
 pub use builder::{MintBuilder, MintMeltLimits};
+pub use cdk_common::common::UnitMetadata;
 pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use verification::Verification;
 
@@ -70,6 +71,7 @@ pub struct Mint {
     static_token: Option<String>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
+    keys_metadata: Arc<HashMap<CurrencyUnit, UnitMetadata>>,
 }
 
 impl Mint {
@@ -98,6 +100,7 @@ impl Mint {
             PaymentProcessorKey,
             Arc<dyn MintPayment<Err = cdk_payment::Error> + Send + Sync>,
         >,
+        keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
     ) -> Result<Self, Error> {
         Self::new_internal(
             signatory,
@@ -109,6 +112,7 @@ impl Mint {
             None,
             #[cfg(feature = "auth")]
             None,
+            keys_metadata,
         )
         .await
     }
@@ -125,6 +129,7 @@ impl Mint {
         >,
         open_id_discovery: Option<String>,
         static_token: Option<String>,
+        keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
     ) -> Result<Self, Error> {
         Self::new_internal(
             signatory,
@@ -133,6 +138,7 @@ impl Mint {
             ln,
             open_id_discovery,
             static_token,
+            keys_metadata,
         )
         .await
     }
@@ -151,6 +157,7 @@ impl Mint {
         >,
         #[cfg(feature = "auth")] open_id_discovery: Option<String>,
         #[cfg(feature = "auth")] static_token: Option<String>,
+        keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
     ) -> Result<Self, Error> {
         #[cfg(feature = "auth")]
         let oidc_client =
@@ -187,6 +194,7 @@ impl Mint {
             #[cfg(feature = "auth")]
             static_token,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
+            keys_metadata: Arc::new(keys_metadata),
         })
     }
 
@@ -367,6 +375,11 @@ impl Mint {
                 }
             })
             .next()
+    }
+
+    /// Get unit metadata
+    pub fn get_unit_metadata(&self, unit: CurrencyUnit) -> Option<UnitMetadata> {
+        self.keys_metadata.get(&unit).cloned()
     }
 
     /// Blind Sign
@@ -593,7 +606,7 @@ mod tests {
             .expect("Failed to create signatory"),
         );
 
-        Mint::new(signatory, localstore, HashMap::new())
+        Mint::new(signatory, localstore, HashMap::new(), HashMap::new())
             .await
             .unwrap()
     }
