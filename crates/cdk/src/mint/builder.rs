@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use bitcoin::bip32::DerivationPath;
+use cdk_common::common::UnitMetadata;
 use cdk_common::database::{self, MintDatabase, MintKeysDatabase};
 use cdk_common::error::Error;
 use cdk_common::nut04::MintMethodOptions;
@@ -51,6 +52,7 @@ pub struct MintBuilder {
     // protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
     openid_discovery: Option<String>,
     signatory: Option<Arc<dyn Signatory + Sync + Send + 'static>>,
+    keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
 }
 
 impl MintBuilder {
@@ -334,6 +336,12 @@ impl MintBuilder {
         Ok(self)
     }
 
+    /// Set unit metadata
+    pub fn set_unit_metadata(mut self, unit: &CurrencyUnit, metadata: UnitMetadata) -> Self {
+        self.keys_metadata.insert(unit.clone(), metadata);
+        self
+    }
+
     /// Build mint
     pub async fn build(&self) -> anyhow::Result<Mint> {
         let localstore = self
@@ -371,7 +379,8 @@ impl MintBuilder {
                 localstore,
                 auth_localstore,
                 ln,
-                openid_discovery.clone(),
+                Some(openid_discovery.clone()),
+                self.keys_metadata.clone(),
             )
             .await?);
         }
@@ -383,7 +392,7 @@ impl MintBuilder {
             ));
         }
 
-        Ok(Mint::new(signatory, localstore, ln).await?)
+        Ok(Mint::new(signatory, localstore, ln, self.keys_metadata.clone()).await?)
     }
 }
 

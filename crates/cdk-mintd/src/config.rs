@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bitcoin::hashes::{sha256, Hash};
+#[cfg(feature = "portalwallet")]
+use cdk::mint::UnitMetadata;
 use cdk::nuts::{CurrencyUnit, PublicKey};
 use cdk::Amount;
 use cdk_axum::cache;
@@ -187,6 +189,7 @@ fn default_max_delay_time() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalWallet {
     pub supported_units: HashMap<CurrencyUnit, u8>,
+    pub unit_info: HashMap<CurrencyUnit, UnitMetadata>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
