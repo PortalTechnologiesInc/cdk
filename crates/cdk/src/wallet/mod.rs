@@ -79,6 +79,7 @@ pub struct Wallet {
     #[cfg(feature = "auth")]
     auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
     xpriv: Xpriv,
+    is_pre_derived: bool,
     client: Arc<dyn MintConnector + Send + Sync>,
     subscription: SubscriptionManager,
 }
@@ -390,6 +391,7 @@ impl Wallet {
                     self.xpriv,
                     start_counter,
                     start_counter + 100,
+                    self.is_pre_derived,
                 )?;
 
                 tracing::debug!(

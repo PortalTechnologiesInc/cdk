@@ -28,6 +28,7 @@ pub struct WalletBuilder {
     #[cfg(feature = "auth")]
     auth_wallet: Option<AuthWallet>,
     seed: Option<Vec<u8>>,
+    is_pre_derived: bool,
     client: Option<Arc<dyn MintConnector + Send + Sync>>,
 }
 
@@ -41,6 +42,7 @@ impl Default for WalletBuilder {
             #[cfg(feature = "auth")]
             auth_wallet: None,
             seed: None,
+            is_pre_derived: false,
             client: None,
         }
     }
@@ -89,6 +91,12 @@ impl WalletBuilder {
     /// Set the seed bytes
     pub fn seed(mut self, seed: &[u8]) -> Self {
         self.seed = Some(seed.to_vec());
+        self
+    }
+
+    /// Set if the wallet is pre-derived
+    pub fn is_pre_derived(mut self, is_pre_derived: bool) -> Self {
+        self.is_pre_derived = is_pre_derived;
         self
     }
 
@@ -154,6 +162,7 @@ impl WalletBuilder {
             #[cfg(feature = "auth")]
             auth_wallet: Arc::new(RwLock::new(self.auth_wallet)),
             xpriv,
+            is_pre_derived: self.is_pre_derived,
             client: client.clone(),
             subscription: SubscriptionManager::new(client),
         })

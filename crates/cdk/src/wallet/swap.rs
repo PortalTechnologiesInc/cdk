@@ -259,6 +259,7 @@ impl Wallet {
                     active_keyset_id,
                     count,
                     self.xpriv,
+                    self.is_pre_derived,
                     change_amount,
                     &change_split_target,
                 )?;
@@ -280,6 +281,7 @@ impl Wallet {
                     active_keyset_id,
                     count,
                     self.xpriv,
+                    self.is_pre_derived,
                     send_amount.unwrap_or(Amount::ZERO),
                     &SplitTarget::default(),
                 )?;
@@ -290,6 +292,7 @@ impl Wallet {
                     active_keyset_id,
                     count,
                     self.xpriv,
+                    self.is_pre_derived,
                     change_amount,
                     &change_split_target,
                 )?;

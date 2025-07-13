@@ -152,6 +152,7 @@ impl Wallet {
             active_keyset_id,
             count,
             self.xpriv,
+            self.is_pre_derived,
             proofs_total - quote_info.amount,
         )?;
 

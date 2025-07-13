@@ -222,6 +222,7 @@ impl Wallet {
                 active_keyset_id,
                 count,
                 self.xpriv,
+                self.is_pre_derived,
                 quote_info.amount,
                 &amount_split_target,
             )?,

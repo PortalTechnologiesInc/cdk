@@ -37,8 +37,13 @@ pub enum Error {
 
 impl Secret {
     /// Create new [`Secret`] from xpriv
-    pub fn from_xpriv(xpriv: Xpriv, keyset_id: Id, counter: u32) -> Result<Self, Error> {
-        let path = derive_path_from_keyset_id(keyset_id)?
+    pub fn from_xpriv(
+        xpriv: Xpriv,
+        keyset_id: Id,
+        counter: u32,
+        is_pre_derived: bool,
+    ) -> Result<Self, Error> {
+        let path = derive_path_from_keyset_id(keyset_id, is_pre_derived)?
             .child(ChildNumber::from_hardened_idx(counter)?)
             .child(ChildNumber::from_normal_idx(0)?);
         let derived_xpriv = xpriv.derive_priv(&SECP256K1, &path)?;
@@ -51,8 +56,13 @@ impl Secret {
 
 impl SecretKey {
     /// Create new [`SecretKey`] from xpriv
-    pub fn from_xpriv(xpriv: Xpriv, keyset_id: Id, counter: u32) -> Result<Self, Error> {
-        let path = derive_path_from_keyset_id(keyset_id)?
+    pub fn from_xpriv(
+        xpriv: Xpriv,
+        keyset_id: Id,
+        counter: u32,
+        is_pre_derived: bool,
+    ) -> Result<Self, Error> {
+        let path = derive_path_from_keyset_id(keyset_id, is_pre_derived)?
             .child(ChildNumber::from_hardened_idx(counter)?)
             .child(ChildNumber::from_normal_idx(1)?);
         let derived_xpriv = xpriv.derive_priv(&SECP256K1, &path)?;
@@ -69,6 +79,7 @@ impl PreMintSecrets {
         keyset_id: Id,
         counter: u32,
         xpriv: Xpriv,
+        is_pre_derived: bool,
         amount: Amount,
         amount_split_target: &SplitTarget,
     ) -> Result<Self, Error> {
@@ -77,8 +88,8 @@ impl PreMintSecrets {
         let mut counter = counter;
 
         for amount in amount.split_targeted(amount_split_target)? {
-            let secret = Secret::from_xpriv(xpriv, keyset_id, counter)?;
-            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, counter)?;
+            let secret = Secret::from_xpriv(xpriv, keyset_id, counter, is_pre_derived)?;
+            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, counter, is_pre_derived)?;
 
             let (blinded, r) = blind_message(&secret.to_bytes(), Some(blinding_factor))?;
 
@@ -103,6 +114,7 @@ impl PreMintSecrets {
         keyset_id: Id,
         counter: u32,
         xpriv: Xpriv,
+        is_pre_derived: bool,
         amount: Amount,
     ) -> Result<Self, Error> {
         if amount <= Amount::ZERO {
@@ -114,8 +126,8 @@ impl PreMintSecrets {
         let mut counter = counter;
 
         for _ in 0..count {
-            let secret = Secret::from_xpriv(xpriv, keyset_id, counter)?;
-            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, counter)?;
+            let secret = Secret::from_xpriv(xpriv, keyset_id, counter, is_pre_derived)?;
+            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, counter, is_pre_derived)?;
 
             let (blinded, r) = blind_message(&secret.to_bytes(), Some(blinding_factor))?;
 
@@ -144,12 +156,13 @@ impl PreMintSecrets {
         xpriv: Xpriv,
         start_count: u32,
         end_count: u32,
+        is_pre_derived: bool,
     ) -> Result<Self, Error> {
         let mut pre_mint_secrets = PreMintSecrets::new(keyset_id);
 
         for i in start_count..=end_count {
-            let secret = Secret::from_xpriv(xpriv, keyset_id, i)?;
-            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, i)?;
+            let secret = Secret::from_xpriv(xpriv, keyset_id, i, is_pre_derived)?;
+            let blinding_factor = SecretKey::from_xpriv(xpriv, keyset_id, i, is_pre_derived)?;
 
             let (blinded, r) = blind_message(&secret.to_bytes(), Some(blinding_factor))?;
 
@@ -169,15 +182,19 @@ impl PreMintSecrets {
     }
 }
 
-fn derive_path_from_keyset_id(id: Id) -> Result<DerivationPath, Error> {
+fn derive_path_from_keyset_id(id: Id, is_pre_derived: bool) -> Result<DerivationPath, Error> {
     let index = u32::from(id);
 
+    let mut path = Vec::new();
+    if !is_pre_derived {
+        path.push(ChildNumber::from_hardened_idx(129372)?);
+        path.push(ChildNumber::from_hardened_idx(0)?);
+    }
+
     let keyset_child_number = ChildNumber::from_hardened_idx(index)?;
-    Ok(DerivationPath::from(vec![
-        ChildNumber::from_hardened_idx(129372)?,
-        ChildNumber::from_hardened_idx(0)?,
-        keyset_child_number,
-    ]))
+    path.push(keyset_child_number);
+
+    Ok(DerivationPath::from(path))
 }
 
 #[cfg(test)]
@@ -208,7 +225,8 @@ mod tests {
         ];
 
         for (i, test_secret) in test_secrets.iter().enumerate() {
-            let secret = Secret::from_xpriv(xpriv, keyset_id, i.try_into().unwrap()).unwrap();
+            let secret =
+                Secret::from_xpriv(xpriv, keyset_id, i.try_into().unwrap(), false).unwrap();
             assert_eq!(secret, Secret::from_str(test_secret).unwrap())
         }
     }
@@ -230,7 +248,7 @@ mod tests {
         ];
 
         for (i, test_r) in test_rs.iter().enumerate() {
-            let r = SecretKey::from_xpriv(xpriv, keyset_id, i.try_into().unwrap()).unwrap();
+            let r = SecretKey::from_xpriv(xpriv, keyset_id, i.try_into().unwrap(), false).unwrap();
             assert_eq!(r, SecretKey::from_hex(test_r).unwrap())
         }
     }
@@ -245,7 +263,7 @@ mod tests {
 
         for (id_hex, expected_path) in test_cases {
             let id = Id::from_str(id_hex).unwrap();
-            let path = derive_path_from_keyset_id(id).unwrap();
+            let path = derive_path_from_keyset_id(id, false).unwrap();
             assert_eq!(
                 DerivationPath::from_str(expected_path).unwrap(),
                 path,
