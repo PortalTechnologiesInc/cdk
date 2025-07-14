@@ -119,6 +119,8 @@ pub enum AuthToken {
     ClearAuth(String),
     /// Blind Auth token
     BlindAuth(BlindAuthToken),
+    /// Static Auth token
+    StaticAuth(String),
 }
 
 impl fmt::Display for AuthToken {
@@ -126,6 +128,7 @@ impl fmt::Display for AuthToken {
         match self {
             Self::ClearAuth(cat) => cat.fmt(f),
             Self::BlindAuth(bat) => bat.fmt(f),
+            Self::StaticAuth(sat) => sat.fmt(f),
         }
     }
 }
@@ -136,6 +139,7 @@ impl AuthToken {
         match self {
             Self::ClearAuth(_) => "Clear-auth".to_string(),
             Self::BlindAuth(_) => "Blind-auth".to_string(),
+            Self::StaticAuth(_) => "Static-auth".to_string(),
         }
     }
 }
@@ -147,6 +151,8 @@ pub enum AuthRequired {
     Clear,
     /// Blind Auth token
     Blind,
+    /// Static Auth token
+    Static,
 }
 
 /// Auth Proofs

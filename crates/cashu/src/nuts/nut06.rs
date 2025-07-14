@@ -235,6 +235,13 @@ impl MintInfo {
                 protected_endpoints.insert(*endpoint, AuthRequired::Blind);
             }
         }
+
+        if let Some(nut_xx_settings) = &self.nuts.nut_xx {
+            for endpoint in nut_xx_settings.protected_endpoints.iter() {
+                protected_endpoints.insert(*endpoint, AuthRequired::Static);
+            }
+        }
+
         protected_endpoints
     }
 
@@ -336,6 +343,26 @@ pub struct Nuts {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg(feature = "auth")]
     pub nut22: Option<BlindAuthSettings>,
+
+    /// Static auth settings
+    pub nut_xx: Option<StaticAuthSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+/// Static auth settings
+pub struct StaticAuthSettings {
+    /// Protected endpoints
+    pub protected_endpoints: Vec<ProtectedEndpoint>,
+}
+
+impl StaticAuthSettings {
+    /// Create new [`StaticAuthSettings`]
+    pub fn new(protected_endpoints: Vec<ProtectedEndpoint>) -> Self {
+        Self {
+            protected_endpoints,
+        }
+    }
 }
 
 impl Nuts {

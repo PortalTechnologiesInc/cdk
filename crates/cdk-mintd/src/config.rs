@@ -223,10 +223,27 @@ pub struct Database {
     pub engine: DatabaseEngine,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ClearAuthMethod {
+    OpenID {
+        discovery_url: String,
+        client_id: String,
+    },
+    Static {
+        token: String,
+    },
+    None,
+}
+
+impl Default for ClearAuthMethod {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Auth {
-    pub openid_discovery: String,
-    pub openid_client_id: String,
+    pub method: ClearAuthMethod,
     pub mint_max_bat: u64,
     #[serde(default = "default_true")]
     pub enabled_mint: bool,

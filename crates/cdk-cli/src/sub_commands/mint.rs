@@ -39,6 +39,9 @@ pub async fn mint(
 
     let wallet = get_or_create_wallet(multi_mint_wallet, &mint_url, unit).await?;
 
+    // Refresh mint info, if necessary this will set up the auth wallet
+    wallet.get_mint_info().await?;
+
     let quote_id = match &sub_command_args.quote_id {
         None => {
             let amount = sub_command_args

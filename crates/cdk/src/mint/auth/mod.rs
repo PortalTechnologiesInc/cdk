@@ -83,6 +83,13 @@ impl Mint {
                     );
                     return Err(Error::BlindAuthRequired);
                 }
+                AuthRequired::Static => {
+                    tracing::warn!(
+                        "No auth token provided for protected endpoint: {:?}, expected static auth.",
+                        endpoint
+                    );
+                    return Err(Error::StaticAuthRequired);
+                }
             },
         };
 
@@ -120,6 +127,15 @@ impl Mint {
                         err
                     })?;
             }
+            (AuthRequired::Static, AuthToken::StaticAuth(token)) => {
+                tracing::debug!("Verifying static auth token");
+                if Some(token) == self.static_token {
+                    tracing::debug!("Static auth token verification successful");
+                    return Ok(());
+                } else {
+                    return Err(Error::StaticAuthFailed);
+                }
+            }
             (AuthRequired::Blind, other) => {
                 tracing::warn!(
                     "Blind auth required but received different auth type: {:?}",
@@ -133,6 +149,13 @@ impl Mint {
                     other
                 );
                 return Err(Error::ClearAuthRequired);
+            }
+            (AuthRequired::Static, other) => {
+                tracing::warn!(
+                    "Static auth required but received different auth type: {:?}",
+                    other
+                );
+                return Err(Error::StaticAuthRequired);
             }
         }
 

@@ -10,6 +10,7 @@ use cdk_common::database::{self, MintDatabase, MintKeysDatabase};
 use cdk_common::error::Error;
 use cdk_common::nut04::MintMethodOptions;
 use cdk_common::nut05::MeltMethodOptions;
+use cdk_common::nut06::StaticAuthSettings;
 use cdk_common::payment::Bolt11Settings;
 use cdk_common::{nut21, nut22};
 use cdk_signatory::signatory::Signatory;
@@ -51,6 +52,7 @@ pub struct MintBuilder {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     // protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
     openid_discovery: Option<String>,
+    static_token: Option<String>,
     signatory: Option<Arc<dyn Signatory + Sync + Send + 'static>>,
     keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
 }
@@ -118,6 +120,12 @@ impl MintBuilder {
     /// Set Openid discovery url
     pub fn with_openid_discovery(mut self, openid_discovery: String) -> Self {
         self.openid_discovery = Some(openid_discovery);
+        self
+    }
+
+    /// Set static token
+    pub fn with_static_token(mut self, static_token: String) -> Self {
+        self.static_token = Some(static_token);
         self
     }
 
@@ -322,6 +330,15 @@ impl MintBuilder {
         self
     }
 
+    /// Set static auth settings
+    pub fn set_static_auth_settings(mut self, static_token: String) -> Self {
+        let mut nuts = self.mint_info.nuts;
+        nuts.nut_xx = Some(StaticAuthSettings::new(vec![]));
+        self.mint_info.nuts = nuts;
+        self.static_token = Some(static_token);
+        self
+    }
+
     /// Sets the input fee ppk for a given unit
     ///
     /// The unit **MUST** already have been added with a ln backend
@@ -380,6 +397,26 @@ impl MintBuilder {
                 auth_localstore,
                 ln,
                 Some(openid_discovery.clone()),
+                None,
+                self.keys_metadata.clone(),
+            )
+            .await?);
+        }
+
+        #[cfg(feature = "auth")]
+        if let Some(static_token) = &self.static_token {
+            let auth_localstore = self
+                .auth_localstore
+                .clone()
+                .ok_or(anyhow!("Auth localstore not set"))?;
+
+            return Ok(Mint::new_with_auth(
+                signatory,
+                localstore,
+                auth_localstore,
+                ln,
+                None,
+                Some(static_token.clone()),
                 self.keys_metadata.clone(),
             )
             .await?);

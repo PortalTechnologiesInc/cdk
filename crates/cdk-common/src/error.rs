@@ -64,12 +64,18 @@ pub enum Error {
     /// Blind Auth Required
     #[error("Blind Auth Required")]
     BlindAuthRequired,
+    /// Static Auth Required
+    #[error("Static Auth Required")]
+    StaticAuthRequired,
     /// Clear Auth Failed
     #[error("Clear Auth Failed")]
     ClearAuthFailed,
     /// Blind Auth Failed
     #[error("Blind Auth Failed")]
     BlindAuthFailed,
+    /// Static Auth Failed
+    #[error("Static Auth Failed")]
+    StaticAuthFailed,
     /// Auth settings undefined
     #[error("Auth settings undefined")]
     AuthSettingsUndefined,

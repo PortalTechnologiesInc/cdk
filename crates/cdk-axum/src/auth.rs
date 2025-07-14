@@ -18,6 +18,7 @@ use crate::{get_keyset_pubkeys, into_response, MintState};
 
 const CLEAR_AUTH_KEY: &str = "Clear-auth";
 const BLIND_AUTH_KEY: &str = "Blind-auth";
+const STATIC_AUTH_KEY: &str = "Static-auth";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthHeader {
@@ -25,6 +26,8 @@ pub enum AuthHeader {
     Clear(String),
     /// Blind Auth token
     Blind(BlindAuthToken),
+    /// Static Auth token
+    Static(String),
     /// No auth
     None,
 }
@@ -34,6 +37,7 @@ impl From<AuthHeader> for Option<AuthToken> {
         match value {
             AuthHeader::Clear(token) => Some(AuthToken::ClearAuth(token)),
             AuthHeader::Blind(token) => Some(AuthToken::BlindAuth(token)),
+            AuthHeader::Static(token) => Some(AuthToken::StaticAuth(token)),
             AuthHeader::None => None,
         }
     }
@@ -80,6 +84,20 @@ where
                 })?
                 .to_string();
             return Ok(AuthHeader::Clear(token));
+        }
+
+        // Check for Static-auth header
+        if let Some(sat) = parts.headers.get(STATIC_AUTH_KEY) {
+            let token = sat
+                .to_str()
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Invalid Static-auth header value".to_string(),
+                    )
+                })?
+                .to_string();
+            return Ok(AuthHeader::Static(token));
         }
 
         // No authentication headers found - this is now valid

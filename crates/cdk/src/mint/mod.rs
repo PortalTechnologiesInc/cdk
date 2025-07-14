@@ -67,6 +67,8 @@ pub struct Mint {
     pub pubsub_manager: Arc<PubSubManager>,
     #[cfg(feature = "auth")]
     oidc_client: Option<OidcClient>,
+    #[cfg(feature = "auth")]
+    static_token: Option<String>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
     keys_metadata: Arc<HashMap<CurrencyUnit, UnitMetadata>>,
@@ -108,6 +110,8 @@ impl Mint {
             ln,
             #[cfg(feature = "auth")]
             None,
+            #[cfg(feature = "auth")]
+            None,
             keys_metadata,
         )
         .await
@@ -124,6 +128,7 @@ impl Mint {
             Arc<dyn MintPayment<Err = cdk_payment::Error> + Send + Sync>,
         >,
         open_id_discovery: Option<String>,
+        static_token: Option<String>,
         keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
     ) -> Result<Self, Error> {
         Self::new_internal(
@@ -132,6 +137,7 @@ impl Mint {
             Some(auth_localstore),
             ln,
             open_id_discovery,
+            static_token,
             keys_metadata,
         )
         .await
@@ -150,6 +156,7 @@ impl Mint {
             Arc<dyn MintPayment<Err = cdk_payment::Error> + Send + Sync>,
         >,
         #[cfg(feature = "auth")] open_id_discovery: Option<String>,
+        #[cfg(feature = "auth")] static_token: Option<String>,
         keys_metadata: HashMap<CurrencyUnit, UnitMetadata>,
     ) -> Result<Self, Error> {
         #[cfg(feature = "auth")]
@@ -181,6 +188,8 @@ impl Mint {
             localstore,
             #[cfg(feature = "auth")]
             oidc_client,
+            #[cfg(feature = "auth")]
+            static_token,
             ln,
             #[cfg(feature = "auth")]
             auth_localstore,
@@ -201,6 +210,7 @@ impl Mint {
 
             let mut clear_auth_endpoints: Vec<ProtectedEndpoint> = vec![];
             let mut blind_auth_endpoints: Vec<ProtectedEndpoint> = vec![];
+            let mut static_auth_endpoints: Vec<ProtectedEndpoint> = vec![];
 
             for (endpoint, auth) in auth_endpoints {
                 match auth {
@@ -209,6 +219,9 @@ impl Mint {
                     }
                     Some(AuthRequired::Blind) => {
                         blind_auth_endpoints.push(endpoint);
+                    }
+                    Some(AuthRequired::Static) => {
+                        static_auth_endpoints.push(endpoint);
                     }
                     None => (),
                 }
@@ -223,6 +236,12 @@ impl Mint {
                 a.protected_endpoints = blind_auth_endpoints;
                 a
             });
+
+            mint_info.nuts.nut_xx = mint_info.nuts.nut_xx.map(|mut a| {
+                a.protected_endpoints = static_auth_endpoints;
+                a
+            });
+
             mint_info
         } else {
             mint_info

@@ -563,14 +563,22 @@ async fn setup_authentication(
         let mint_blind_auth_endpoint =
             ProtectedEndpoint::new(Method::Post, RoutePath::MintBlindAuth);
 
-        mint_builder = mint_builder.set_clear_auth_settings(
-            auth_settings.openid_discovery,
-            auth_settings.openid_client_id,
-        );
+        match auth_settings.method {
+            crate::config::ClearAuthMethod::OpenID {
+                discovery_url,
+                client_id,
+            } => {
+                mint_builder = mint_builder.set_clear_auth_settings(discovery_url, client_id);
+            }
+            crate::config::ClearAuthMethod::Static { token } => {
+                mint_builder = mint_builder.set_static_auth_settings(token);
+            }
+            _ => unreachable!(),
+        }
 
         let mut protected_endpoints = HashMap::new();
 
-        protected_endpoints.insert(mint_blind_auth_endpoint, AuthRequired::Clear);
+        protected_endpoints.insert(mint_blind_auth_endpoint, AuthRequired::Static);
 
         let mut blind_auth_endpoints = vec![];
         let mut unprotected_endpoints = vec![];
@@ -581,9 +589,9 @@ async fn setup_authentication(
             let mint_protected_endpoint =
                 ProtectedEndpoint::new(Method::Post, RoutePath::MintBolt11);
             if auth_settings.enabled_mint {
-                protected_endpoints.insert(mint_quote_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(mint_quote_protected_endpoint, AuthRequired::Static);
 
-                protected_endpoints.insert(mint_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(mint_protected_endpoint, AuthRequired::Static);
 
                 blind_auth_endpoints.push(mint_quote_protected_endpoint);
                 blind_auth_endpoints.push(mint_protected_endpoint);
@@ -600,8 +608,8 @@ async fn setup_authentication(
                 ProtectedEndpoint::new(Method::Post, RoutePath::MeltBolt11);
 
             if auth_settings.enabled_melt {
-                protected_endpoints.insert(melt_quote_protected_endpoint, AuthRequired::Blind);
-                protected_endpoints.insert(melt_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(melt_quote_protected_endpoint, AuthRequired::Static);
+                protected_endpoints.insert(melt_protected_endpoint, AuthRequired::Static);
 
                 blind_auth_endpoints.push(melt_quote_protected_endpoint);
                 blind_auth_endpoints.push(melt_protected_endpoint);
@@ -615,7 +623,7 @@ async fn setup_authentication(
             let swap_protected_endpoint = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
 
             if auth_settings.enabled_swap {
-                protected_endpoints.insert(swap_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(swap_protected_endpoint, AuthRequired::Static);
                 blind_auth_endpoints.push(swap_protected_endpoint);
             } else {
                 unprotected_endpoints.push(swap_protected_endpoint);
@@ -627,7 +635,7 @@ async fn setup_authentication(
                 ProtectedEndpoint::new(Method::Get, RoutePath::MintQuoteBolt11);
 
             if auth_settings.enabled_check_mint_quote {
-                protected_endpoints.insert(check_mint_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(check_mint_protected_endpoint, AuthRequired::Static);
                 blind_auth_endpoints.push(check_mint_protected_endpoint);
             } else {
                 unprotected_endpoints.push(check_mint_protected_endpoint);
@@ -639,7 +647,7 @@ async fn setup_authentication(
                 ProtectedEndpoint::new(Method::Get, RoutePath::MeltQuoteBolt11);
 
             if auth_settings.enabled_check_melt_quote {
-                protected_endpoints.insert(check_melt_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(check_melt_protected_endpoint, AuthRequired::Static);
                 blind_auth_endpoints.push(check_melt_protected_endpoint);
             } else {
                 unprotected_endpoints.push(check_melt_protected_endpoint);
@@ -651,7 +659,7 @@ async fn setup_authentication(
                 ProtectedEndpoint::new(Method::Post, RoutePath::Restore);
 
             if auth_settings.enabled_restore {
-                protected_endpoints.insert(restore_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(restore_protected_endpoint, AuthRequired::Static);
                 blind_auth_endpoints.push(restore_protected_endpoint);
             } else {
                 unprotected_endpoints.push(restore_protected_endpoint);
@@ -663,7 +671,7 @@ async fn setup_authentication(
                 ProtectedEndpoint::new(Method::Post, RoutePath::Checkstate);
 
             if auth_settings.enabled_check_proof_state {
-                protected_endpoints.insert(state_protected_endpoint, AuthRequired::Blind);
+                protected_endpoints.insert(state_protected_endpoint, AuthRequired::Static);
                 blind_auth_endpoints.push(state_protected_endpoint);
             } else {
                 unprotected_endpoints.push(state_protected_endpoint);

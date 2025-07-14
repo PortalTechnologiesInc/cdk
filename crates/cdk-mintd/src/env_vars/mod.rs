@@ -65,11 +65,11 @@ impl Settings {
         #[cfg(feature = "auth")]
         {
             // Check env vars for auth config even if None
+
             let auth = self.auth.clone().unwrap_or_default().from_env();
 
             // Only set auth if env vars are present and have non-default values
-            if auth.openid_discovery != String::default()
-                || auth.openid_client_id != String::default()
+            if auth.method != crate::config::ClearAuthMethod::None
                 || auth.mint_max_bat != 0
                 || auth.enabled_mint
                 || auth.enabled_melt

@@ -49,6 +49,9 @@ struct Cli {
     /// NWS Proxy
     #[arg(short, long)]
     proxy: Option<Url>,
+    /// Static auth token
+    #[arg(short, long)]
+    static_token: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -202,6 +205,10 @@ async fn main() -> Result<()> {
 
             if let Some(http_client) = &proxy_client {
                 builder = builder.client(http_client.clone());
+            }
+
+            if let Some(static_token) = &args.static_token {
+                builder = builder.static_token(static_token.clone());
             }
 
             let wallet = builder.build()?;

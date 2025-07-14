@@ -78,6 +78,8 @@ pub struct Wallet {
     pub target_proof_count: usize,
     #[cfg(feature = "auth")]
     auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
+    #[cfg(feature = "auth")]
+    static_token: Option<String>,
     xpriv: Xpriv,
     is_pre_derived: bool,
     client: Arc<dyn MintConnector + Send + Sync>,
@@ -285,6 +287,7 @@ impl Wallet {
                                 self.localstore.clone(),
                                 mint_info.protected_endpoints(),
                                 oidc_client,
+                                self.static_token.clone(),
                             );
                             *auth_wallet = Some(new_auth_wallet.clone());
 

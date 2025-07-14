@@ -27,6 +27,8 @@ pub struct WalletBuilder {
     target_proof_count: Option<usize>,
     #[cfg(feature = "auth")]
     auth_wallet: Option<AuthWallet>,
+    #[cfg(feature = "auth")]
+    static_token: Option<String>,
     seed: Option<Vec<u8>>,
     is_pre_derived: bool,
     client: Option<Arc<dyn MintConnector + Send + Sync>>,
@@ -41,6 +43,8 @@ impl Default for WalletBuilder {
             target_proof_count: Some(3),
             #[cfg(feature = "auth")]
             auth_wallet: None,
+            #[cfg(feature = "auth")]
+            static_token: None,
             seed: None,
             is_pre_derived: false,
             client: None,
@@ -88,6 +92,13 @@ impl WalletBuilder {
         self
     }
 
+    /// Set the static auth token
+    #[cfg(feature = "auth")]
+    pub fn static_token(mut self, static_token: String) -> Self {
+        self.static_token = Some(static_token);
+        self
+    }
+
     /// Set the seed bytes
     pub fn seed(mut self, seed: &[u8]) -> Self {
         self.seed = Some(seed.to_vec());
@@ -115,6 +126,7 @@ impl WalletBuilder {
             self.localstore.clone().expect("Localstore required"),
             HashMap::new(),
             None,
+            self.static_token.clone(),
         ));
         self
     }
@@ -161,6 +173,8 @@ impl WalletBuilder {
             target_proof_count: self.target_proof_count.unwrap_or(3),
             #[cfg(feature = "auth")]
             auth_wallet: Arc::new(RwLock::new(self.auth_wallet)),
+            #[cfg(feature = "auth")]
+            static_token: self.static_token,
             xpriv,
             is_pre_derived: self.is_pre_derived,
             client: client.clone(),
