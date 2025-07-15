@@ -96,6 +96,8 @@ enum Commands {
     CatLogin(sub_commands::cat_login::CatLoginSubCommand),
     /// Cat login with device code flow
     CatDeviceLogin(sub_commands::cat_device_login::CatDeviceLoginSubCommand),
+    /// Get unit metadata
+    UnitInfo(sub_commands::unit_info::UnitInfoSubCommand),
 }
 
 #[tokio::main]
@@ -300,6 +302,9 @@ async fn main() -> Result<()> {
                 &work_dir,
             )
             .await
+        }
+        Commands::UnitInfo(sub_command_args) => {
+            sub_commands::unit_info::unit_info(&multi_mint_wallet, sub_command_args).await
         }
     }
 }

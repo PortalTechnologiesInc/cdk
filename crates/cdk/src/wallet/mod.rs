@@ -29,6 +29,7 @@ use crate::util::unix_time;
 use crate::Amount;
 #[cfg(feature = "auth")]
 use crate::OidcClient;
+use cdk_common::common::UnitMetadata;
 
 #[cfg(feature = "auth")]
 mod auth;
@@ -243,8 +244,8 @@ impl Wallet {
         Ok(())
     }
 
-    /// Query mint for current mint information
-    #[instrument(skip(self))]
+    /// Get mint info
+    #[instrument(skip_all)]
     pub async fn get_mint_info(&self) -> Result<Option<MintInfo>, Error> {
         match self.client.get_mint_info().await {
             Ok(mint_info) => {
@@ -309,6 +310,12 @@ impl Wallet {
                 Ok(None)
             }
         }
+    }
+
+    /// Get unit metadata
+    #[instrument(skip_all)]
+    pub async fn get_unit_metadata(&self) -> Result<Option<UnitMetadata>, Error> {
+        self.client.get_unit_metadata(self.unit.clone()).await
     }
 
     /// Get amounts needed to refill proof state

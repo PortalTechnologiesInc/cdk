@@ -23,6 +23,7 @@ use crate::nuts::{CurrencyUnit, MeltOptions, Proof, Proofs, SpendingConditions, 
 use crate::types::Melted;
 use crate::wallet::types::MintQuote;
 use crate::{ensure_cdk, Amount, Wallet};
+use cdk_common::common::UnitMetadata;
 
 /// Multi Mint Wallet
 #[derive(Debug, Clone)]
@@ -382,5 +383,19 @@ impl MultiMintWallet {
             .ok_or(Error::UnknownWallet(wallet_key.clone()))?;
 
         wallet.verify_token_dleq(token).await
+    }
+
+    /// Get unit metadata for a specific wallet
+    #[instrument(skip(self))]
+    pub async fn get_unit_metadata(
+        &self,
+        wallet_key: &WalletKey,
+    ) -> Result<Option<UnitMetadata>, Error> {
+        let wallets = self.wallets.read().await;
+        let wallet = wallets
+            .get(wallet_key)
+            .ok_or(Error::UnknownWallet(wallet_key.clone()))?;
+
+        wallet.get_unit_metadata().await
     }
 }

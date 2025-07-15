@@ -5,14 +5,19 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 
 use super::Error;
+use crate::error::ErrorResponse;
+use crate::mint_url::MintUrl;
+#[cfg(feature = "auth")]
+use crate::nuts::nut22::MintAuthRequest;
 use crate::nuts::{
-    CheckStateRequest, CheckStateResponse, Id, KeySet, KeysetResponse, MeltQuoteBolt11Request,
-    MeltQuoteBolt11Response, MeltRequest, MintInfo, MintQuoteBolt11Request,
-    MintQuoteBolt11Response, MintRequest, MintResponse, RestoreRequest, RestoreResponse,
-    SwapRequest, SwapResponse,
+    AuthToken, CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, KeySet, KeysResponse,
+    KeysetResponse, MeltQuoteBolt11Request, MeltQuoteBolt11Response, MeltRequest, MintInfo,
+    MintQuoteBolt11Request, MintQuoteBolt11Response, MintRequest, MintResponse, RestoreRequest,
+    RestoreResponse, SwapRequest, SwapResponse,
 };
 #[cfg(feature = "auth")]
 use crate::wallet::AuthWallet;
+use cdk_common::common::UnitMetadata;
 
 mod http_client;
 
@@ -62,6 +67,8 @@ pub trait MintConnector: Debug {
     async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error>;
     /// Get Mint Info [NUT-06]
     async fn get_mint_info(&self) -> Result<MintInfo, Error>;
+    /// Get Unit Metadata
+    async fn get_unit_metadata(&self, unit: CurrencyUnit) -> Result<Option<UnitMetadata>, Error>;
     /// Spendable check [NUT-07]
     async fn post_check_state(
         &self,

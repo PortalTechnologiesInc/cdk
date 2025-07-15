@@ -19,13 +19,14 @@ use crate::mint_url::MintUrl;
 #[cfg(feature = "auth")]
 use crate::nuts::nut22::MintAuthRequest;
 use crate::nuts::{
-    AuthToken, CheckStateRequest, CheckStateResponse, Id, KeySet, KeysResponse, KeysetResponse,
-    MeltQuoteBolt11Request, MeltQuoteBolt11Response, MeltRequest, MintInfo, MintQuoteBolt11Request,
-    MintQuoteBolt11Response, MintRequest, MintResponse, RestoreRequest, RestoreResponse,
-    SwapRequest, SwapResponse,
+    AuthToken, CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, KeySet, KeysResponse,
+    KeysetResponse, MeltQuoteBolt11Request, MeltQuoteBolt11Response, MeltRequest, MintInfo,
+    MintQuoteBolt11Request, MintQuoteBolt11Response, MintRequest, MintResponse, RestoreRequest,
+    RestoreResponse, SwapRequest, SwapResponse,
 };
 #[cfg(feature = "auth")]
 use crate::wallet::auth::{AuthMintConnector, AuthWallet};
+use cdk_common::common::UnitMetadata;
 
 #[derive(Debug, Clone)]
 struct HttpClientCore {
@@ -353,6 +354,18 @@ impl MintConnector for HttpClient {
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
         let url = self.mint_url.join_paths(&["v1", "info"])?;
         self.core.http_get(url, None).await
+    }
+
+    /// Get Unit Metadata
+    async fn get_unit_metadata(&self, unit: CurrencyUnit) -> Result<Option<UnitMetadata>, Error> {
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "unit", &unit.to_string()])?;
+        match self.core.http_get::<_, UnitMetadata>(url, None).await {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(Error::HttpError(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     #[cfg(feature = "auth")]
