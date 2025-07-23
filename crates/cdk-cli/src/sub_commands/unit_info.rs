@@ -72,9 +72,18 @@ pub async fn unit_info(
     {
         Ok(Ok(Some(metadata))) => {
             println!("Unit Metadata for {}:{}", mint_url, unit);
-            println!("  Description: {}", metadata.description);
-            println!("  URL: {}", metadata.url);
-            println!("  Is Non-Fungible: {}", metadata.is_non_fungible);
+            println!(
+                "  Front Card Background: {:?}",
+                metadata.front_card_background
+            );
+            println!(
+                "  Back Card Background: {:?}",
+                metadata.back_card_background
+            );
+            println!("  Title: {:?}", metadata.title);
+            println!("  Description: {:?}", metadata.description);
+            println!("  Kind: {:?}", metadata.kind);
+            println!("  Show Individually: {}", metadata.show_individually);
         }
         Ok(Ok(None)) => {
             println!("No unit metadata available for {}:{}", mint_url, unit);

@@ -162,15 +162,37 @@ impl PaymentProcessorKey {
     }
 }
 
+/// Kind of unit
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitKind {
+    Event {
+        date: Option<String>,
+        location: Option<String>,
+    },
+    Other,
+}
+
+impl Default for UnitKind {
+    fn default() -> Self {
+        Self::Other
+    }
+}
+
 /// Unit Metadata
 #[derive(Debug, Default, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitMetadata {
-    /// Human readable description of the unit
-    pub description: String,
-    /// URL for more info
-    pub url: String,
-    /// Whether the unit is non-fungible
-    pub is_non_fungible: bool,
+    /// Front card background
+    pub front_card_background: Option<String>,
+    /// Back card background
+    pub back_card_background: Option<String>,
+    /// Title
+    pub title: Option<String>,
+    /// Description
+    pub description: Option<String>,
+    /// Kind
+    pub kind: UnitKind,
+    /// Show individually or aggregate the balance
+    pub show_individually: bool,
 }
 
 /// Secs wuotes are valid
