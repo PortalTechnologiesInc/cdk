@@ -219,6 +219,37 @@
           packages = {
             inherit cdk-mintd;
             default = cdk-mintd;
+
+            cdk-mintd-docker =
+              let
+                minimal-closure = pkgs.runCommand "cdk-mintd-minimal"
+                  {
+                    nativeBuildInputs = [ pkgs.removeReferencesTo ];
+                  } ''
+                  mkdir -p $out/bin
+                  cp ${cdk-mintd}/bin/cdk-mintd $out/bin/
+
+                  for binary in $out/bin/*; do
+                    remove-references-to -t ${pkgs.rustPlatform.rust.rustc} "$binary"
+                  done
+                '';
+              in
+              pkgs.dockerTools.buildLayeredImage {
+                name = "getportal/cdk-mintd";
+                tag = if system == "x86_64-linux" then "amd64" else "arm64";
+
+                config = {
+                  Cmd = [ "${minimal-closure}/bin/cdk-mintd" "--config" "/config.toml" "--work-dir" "/data" ];
+                  WorkingDir = "/data";
+                  Volumes = {
+                    "/data" = { };
+                    "/config.toml" = { };
+                  };
+                  ExposedPorts = {
+                    "3338/tcp" = { };
+                  };
+                };
+              };
           } // lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
             my-workspace-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
               inherit cargoArtifacts;
