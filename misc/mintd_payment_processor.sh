@@ -50,6 +50,7 @@ cleanup() {
     unset CDK_MINTD_GRPC_PAYMENT_PROCESSOR_SUPPORTED_UNITS
     unset CDK_MINTD_MNEMONIC
     unset CDK_MINTD_PID
+    unset CDK_PAYMENT_PROCESSOR_CLN_BOLT12
 }
 
 # Set up trap to call cleanup on script exit
@@ -79,7 +80,7 @@ cargo build -p cdk-integration-tests
 export CDK_TEST_REGTEST=0
 if [ "$LN_BACKEND" != "FAKEWALLET" ]; then
     export CDK_TEST_REGTEST=1
-    cargo run --bin start_regtest &
+    cargo run --bin start_regtest "$CDK_ITESTS_DIR" &
     CDK_REGTEST_PID=$!
     mkfifo "$CDK_ITESTS_DIR/progress_pipe"
     rm -f "$CDK_ITESTS_DIR/signal_received"  # Ensure clean state
@@ -102,6 +103,7 @@ if [ "$LN_BACKEND" != "FAKEWALLET" ]; then
         sleep 1
     done
     echo "Regtest set up continuing"
+    export CDK_PAYMENT_PROCESSOR_CLN_BOLT12=true
 fi
 
 # Start payment processor
@@ -121,11 +123,12 @@ export CDK_PAYMENT_PROCESSOR_LISTEN_PORT="8090";
 
 echo "$CDK_PAYMENT_PROCESSOR_CLN_RPC_PATH"
 
+cargo b --bin cdk-payment-processor
+
 cargo run --bin cdk-payment-processor &
 
 CDK_PAYMENT_PROCESSOR_PID=$!
 
-sleep 10;
 
 export CDK_MINTD_URL="http://$CDK_ITESTS_MINT_ADDR:$CDK_ITESTS_MINT_PORT_0";
 export CDK_MINTD_WORK_DIR="$CDK_ITESTS_DIR";
@@ -137,12 +140,14 @@ export CDK_MINTD_GRPC_PAYMENT_PROCESSOR_PORT="8090";
 export CDK_MINTD_GRPC_PAYMENT_PROCESSOR_SUPPORTED_UNITS="sat";
 export CDK_MINTD_MNEMONIC="eye survey guilt napkin crystal cup whisper salt luggage manage unveil loyal";
  
+cargo build --bin cdk-mintd --no-default-features --features grpc-processor
+
 cargo run --bin cdk-mintd --no-default-features --features grpc-processor &
 CDK_MINTD_PID=$!
 
 echo $CDK_ITESTS_DIR
 
-TIMEOUT=100
+TIMEOUT=300
 START_TIME=$(date +%s)
 # Loop until the endpoint returns a 200 OK status or timeout is reached
 while true; do
@@ -176,6 +181,18 @@ cargo test -p cdk-integration-tests --test happy_path_mint_wallet
 
 # Capture the exit status of cargo test
 test_status=$?
+
+if [ "$LN_BACKEND" = "CLN" ]; then
+    echo "Running bolt12 tests for CLN backend"
+    cargo test -p cdk-integration-tests --test bolt12
+    bolt12_test_status=$?
+    
+    # Exit with non-zero status if either test failed
+    if [ $test_status -ne 0 ] || [ $bolt12_test_status -ne 0 ]; then
+        echo "Tests failed - happy_path_mint_wallet: $test_status, bolt12: $bolt12_test_status"
+        exit 1
+    fi
+fi
 
 # Exit with the status of the tests
 exit $test_status

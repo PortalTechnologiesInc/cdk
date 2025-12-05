@@ -18,11 +18,12 @@ use crate::nuts::{
 };
 use crate::types::ProofInfo;
 use crate::wallet::mint_connector::AuthHttpClient;
+use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::{Amount, Error, OidcClient};
 
 /// JWT Claims structure for decoding tokens
 #[derive(Debug, Serialize, Deserialize)]
-struct Claims {
+struct _Claims {
     /// Subject
     sub: Option<String>,
     /// Expiration time (as UTC timestamp)
@@ -39,11 +40,13 @@ pub struct AuthWallet {
     pub mint_url: MintUrl,
     /// Storage backend
     pub localstore: Arc<dyn WalletDatabase<Err = database::Error> + Send + Sync>,
+    /// Mint metadata cache (lock-free cached access to keys, keysets, and mint info)
+    pub metadata_cache: Arc<MintMetadataCache>,
     /// Protected methods
     pub protected_endpoints: Arc<RwLock<HashMap<ProtectedEndpoint, AuthRequired>>>,
     /// Refresh token for auth
     refresh_token: Arc<RwLock<Option<String>>>,
-    client: Arc<dyn AuthMintConnector + Send + Sync>,
+    auth_client: Arc<dyn AuthMintConnector + Send + Sync>,
     /// OIDC client for authentication
     oidc_client: Arc<RwLock<Option<OidcClient>>>,
 }
@@ -54,6 +57,7 @@ impl AuthWallet {
         mint_url: MintUrl,
         cat: Option<AuthToken>,
         localstore: Arc<dyn WalletDatabase<Err = database::Error> + Send + Sync>,
+        metadata_cache: Arc<MintMetadataCache>,
         protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
         oidc_client: Option<OidcClient>,
     ) -> Self {
@@ -61,9 +65,10 @@ impl AuthWallet {
         Self {
             mint_url,
             localstore,
+            metadata_cache,
             protected_endpoints: Arc::new(RwLock::new(protected_endpoints)),
             refresh_token: Arc::new(RwLock::new(None)),
-            client: http_client,
+            auth_client: http_client,
             oidc_client: Arc::new(RwLock::new(oidc_client)),
         }
     }
@@ -71,7 +76,7 @@ impl AuthWallet {
     /// Get the current auth token
     #[instrument(skip(self))]
     pub async fn get_auth_token(&self) -> Result<AuthToken, Error> {
-        self.client.get_auth_token().await
+        self.auth_client.get_auth_token().await
     }
 
     /// Set a new auth token
@@ -98,7 +103,7 @@ impl AuthWallet {
                 if let Some(oidc) = self.oidc_client.read().await.as_ref() {
                     oidc.verify_cat(clear_token).await?;
                 }
-                self.client.set_auth_token(token).await
+                self.auth_client.set_auth_token(token).await
             }
             AuthToken::BlindAuth(_) => Err(Error::Custom(
                 "Cannot set blind auth token directly".to_string(),
@@ -164,86 +169,96 @@ impl AuthWallet {
     /// Query mint for current mint information
     #[instrument(skip(self))]
     pub async fn get_mint_info(&self) -> Result<Option<MintInfo>, Error> {
-        self.client.get_mint_info().await.map(Some).or(Ok(None))
+        self.auth_client
+            .get_mint_info()
+            .await
+            .map(Some)
+            .or(Ok(None))
     }
 
-    /// Get keys for mint keyset
+    /// Fetch keys for mint keyset
     ///
-    /// Selected keys from localstore if they are already known
-    /// If they are not known queries mint for keyset id and stores the [`Keys`]
+    /// Returns keys from metadata cache if available, fetches from mint if not.
     #[instrument(skip(self))]
-    pub async fn get_keyset_keys(&self, keyset_id: Id) -> Result<Keys, Error> {
-        let keys = if let Some(keys) = self.localstore.get_keys(&keyset_id).await? {
-            keys
-        } else {
-            let keys = self.client.get_mint_blind_auth_keyset(keyset_id).await?;
+    pub async fn load_keyset_keys(&self, keyset_id: Id) -> Result<Keys, Error> {
+        let metadata = self
+            .metadata_cache
+            .load_auth(&self.localstore, &self.auth_client)
+            .await?;
+        let active = metadata
+            .active_keysets
+            .iter()
+            .find(|x| x.unit == CurrencyUnit::Auth)
+            .cloned()
+            .ok_or(Error::NoActiveKeyset)?;
 
-            keys.verify_id()?;
-
-            self.localstore.add_keys(keys.clone()).await?;
-
-            keys.keys
-        };
-
-        Ok(keys)
+        metadata
+            .keys
+            .get(&active.id)
+            .map(|x| (*(x.clone())).clone())
+            .ok_or(Error::NoActiveKeyset)
     }
 
-    /// Get active keyset for mint
+    /// Get blind auth keysets from metadata cache
     ///
-    /// Queries mint for current keysets then gets [`Keys`] for any unknown
-    /// keysets
+    /// Checks the metadata cache for auth keysets. If cache is not populated,
+    /// fetches from the mint server and updates the cache.
+    /// This is the main method for getting auth keysets in operations that can work offline
+    /// but will fall back to online if needed.
     #[instrument(skip(self))]
-    pub async fn get_active_mint_blind_auth_keysets(&self) -> Result<Vec<KeySetInfo>, Error> {
-        let keysets = self.client.get_mint_blind_auth_keysets().await?;
-        let keysets = keysets.keysets;
-
-        self.localstore
-            .add_mint_keysets(self.mint_url.clone(), keysets.clone())
+    pub async fn load_mint_keysets(&self) -> Result<Vec<KeySetInfo>, Error> {
+        let metadata = self
+            .metadata_cache
+            .load_auth(&self.localstore, &self.auth_client)
             .await?;
 
-        let active_keysets = keysets
-            .clone()
-            .into_iter()
-            .filter(|k| k.unit == CurrencyUnit::Auth)
-            .collect::<Vec<KeySetInfo>>();
-
-        match self
-            .localstore
-            .get_mint_keysets(self.mint_url.clone())
-            .await?
-        {
-            Some(known_keysets) => {
-                let unknown_keysets: Vec<&KeySetInfo> = keysets
-                    .iter()
-                    .filter(|k| known_keysets.contains(k))
-                    .collect();
-
-                for keyset in unknown_keysets {
-                    self.get_keyset_keys(keyset.id).await?;
+        let auth_keysets = metadata
+            .keysets
+            .iter()
+            .filter_map(|(_, k)| {
+                if k.unit == CurrencyUnit::Auth {
+                    Some((*(k.clone())).clone())
+                } else {
+                    None
                 }
-            }
-            None => {
-                for keyset in keysets {
-                    self.get_keyset_keys(keyset.id).await?;
-                }
-            }
+            })
+            .collect::<Vec<_>>();
+
+        if !auth_keysets.is_empty() {
+            Ok(auth_keysets)
+        } else {
+            Err(Error::UnknownKeySet)
         }
-        Ok(active_keysets)
     }
 
-    /// Get active keyset for mint
+    /// Refresh blind auth keysets by fetching the latest from mint
     ///
-    /// Queries mint for current keysets then gets [`Keys`] for any unknown
-    /// keysets
+    /// Fetches the latest blind auth keyset information from the mint server,
+    /// updating the metadata cache and database. Returns only the keysets with
+    /// Auth currency unit. Use this when you need the most up-to-date keyset information.
     #[instrument(skip(self))]
-    pub async fn get_active_mint_blind_auth_keyset(&self) -> Result<KeySetInfo, Error> {
-        let active_keysets = self.get_active_mint_blind_auth_keysets().await?;
+    pub async fn refresh_keysets(&self) -> Result<Vec<KeySetInfo>, Error> {
+        tracing::debug!("Refreshing auth keysets from mint");
 
-        let keyset = active_keysets.first().ok_or(Error::NoActiveKeyset)?;
+        self.load_mint_keysets().await
+    }
+
+    /// Get the first active blind auth keyset - always goes online
+    ///
+    /// This method always goes online to refresh keysets from the mint and then returns
+    /// the first active keyset found. Use this when you need the most up-to-date
+    /// keyset information for blind auth operations.
+    #[instrument(skip(self))]
+    pub async fn fetch_active_keyset(&self) -> Result<KeySetInfo, Error> {
+        let auth_keysets = self.refresh_keysets().await?;
+        let keyset = auth_keysets.first().ok_or(Error::NoActiveKeyset)?;
         Ok(keyset.clone())
     }
 
-    /// Get unspent proofs for mint
+    /// Get unspent auth proofs from local database only - offline operation
+    ///
+    /// Returns auth proofs from the local database that are in the Unspent state.
+    /// This is an offline operation that does not contact the mint.
     #[instrument(skip(self))]
     pub async fn get_unspent_auth_proofs(&self) -> Result<Vec<AuthProof>, Error> {
         Ok(self
@@ -298,7 +313,7 @@ impl AuthWallet {
             Some(auth) => match auth {
                 AuthRequired::Clear => {
                     tracing::trace!("Clear auth needed for request.");
-                    self.client.get_auth_token().await.map(Some)
+                    self.auth_client.get_auth_token().await.map(Some)
                 }
                 AuthRequired::Blind => {
                     tracing::trace!("Blind auth needed for request getting Auth proof.");
@@ -332,10 +347,7 @@ impl AuthWallet {
             self.get_mint_info().await?;
         }
 
-        let auth_token = self.client.get_auth_token().await?;
-
-        let active_keyset_id = self.get_active_mint_blind_auth_keysets().await?;
-        tracing::debug!("Active ketset: {:?}", active_keyset_id);
+        let auth_token = self.auth_client.get_auth_token().await?;
 
         match &auth_token {
             AuthToken::ClearAuth(cat) => {
@@ -369,24 +381,47 @@ impl AuthWallet {
             }
         }
 
-        let active_keyset_id = self.get_active_mint_blind_auth_keyset().await?.id;
+        let keysets = self
+            .load_mint_keysets()
+            .await?
+            .into_iter()
+            .map(|x| (x.id, x))
+            .collect::<HashMap<_, _>>();
 
-        let premint_secrets =
-            PreMintSecrets::random(active_keyset_id, amount, &SplitTarget::Value(1.into()))?;
+        let active_keyset_id = self.fetch_active_keyset().await?.id;
+        let fee_and_amounts = (
+            keysets
+                .get(&active_keyset_id)
+                .map(|x| x.input_fee_ppk)
+                .unwrap_or_default(),
+            self.load_keyset_keys(active_keyset_id)
+                .await?
+                .iter()
+                .map(|(amount, _)| amount.to_u64())
+                .collect::<Vec<_>>(),
+        )
+            .into();
+
+        let premint_secrets = PreMintSecrets::random(
+            active_keyset_id,
+            amount,
+            &SplitTarget::Value(1.into()),
+            &fee_and_amounts,
+        )?;
 
         let request = MintAuthRequest {
             outputs: premint_secrets.blinded_messages(),
         };
 
-        let mint_res = self.client.post_mint_blind_auth(request).await?;
+        let mint_res = self.auth_client.post_mint_blind_auth(request).await?;
 
-        let keys = self.get_keyset_keys(active_keyset_id).await?;
+        let keys = self.load_keyset_keys(active_keyset_id).await?;
 
         // Verify the signature DLEQ is valid
         {
             assert!(mint_res.signatures.len() == premint_secrets.secrets.len());
             for (sig, premint) in mint_res.signatures.iter().zip(&premint_secrets.secrets) {
-                let keys = self.get_keyset_keys(sig.keyset_id).await?;
+                let keys = self.load_keyset_keys(sig.keyset_id).await?;
                 let key = keys.amount_key(sig.amount).ok_or(Error::AmountKey)?;
                 match sig.verify_dleq(key, premint.blinded_message.blinded_secret) {
                     Ok(_) => (),

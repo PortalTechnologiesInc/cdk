@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use cdk::amount::SplitTarget;
 use cdk::error::Error;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, NotificationPayload};
-use cdk::wallet::{SendOptions, Wallet, WalletSubscription};
+use cdk::nuts::CurrencyUnit;
+use cdk::wallet::{SendOptions, Wallet};
 use cdk::{Amount, OidcClient};
+use cdk_common::amount::SplitTarget;
 use cdk_common::{MintInfo, ProofsMethods};
 use cdk_sqlite::wallet::memory;
 use rand::Rng;
@@ -25,7 +26,7 @@ async fn main() -> Result<(), Error> {
     let localstore = memory::empty().await?;
 
     // Generate a random seed for the wallet
-    let seed = rand::rng().random::<[u8; 32]>();
+    let seed = rand::rng().random::<[u8; 64]>();
 
     // Define the mint URL and currency unit
     let mint_url = "http://127.0.0.1:8085";
@@ -33,10 +34,10 @@ async fn main() -> Result<(), Error> {
     let amount = Amount::from(50);
 
     // Create a new wallet
-    let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), &seed, None)?;
+    let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None)?;
 
     let mint_info = wallet
-        .get_mint_info()
+        .fetch_mint_info()
         .await
         .expect("mint info")
         .expect("could not get mint info");
@@ -57,29 +58,13 @@ async fn main() -> Result<(), Error> {
         .await
         .expect("Could not mint blind auth");
 
-    // Request a mint quote from the wallet
-    let quote = wallet.mint_quote(amount, None).await?;
+    let quote = wallet.mint_quote(amount, None).await.unwrap();
+    let proofs = wallet
+        .wait_and_mint_quote(quote, SplitTarget::default(), None, Duration::from_secs(10))
+        .await
+        .unwrap();
 
-    // Subscribe to updates on the mint quote state
-    let mut subscription = wallet
-        .subscribe(WalletSubscription::Bolt11MintQuoteState(vec![quote
-            .id
-            .clone()]))
-        .await;
-
-    // Wait for the mint quote to be paid
-    while let Some(msg) = subscription.recv().await {
-        if let NotificationPayload::MintQuoteBolt11Response(response) = msg {
-            if response.state == MintQuoteState::Paid {
-                break;
-            }
-        }
-    }
-
-    // Mint the received amount
-    let receive_amount = wallet.mint(&quote.id, SplitTarget::default(), None).await?;
-
-    println!("Received: {}", receive_amount.total_amount()?);
+    println!("Received: {}", proofs.total_amount()?);
 
     // Get the total balance of the wallet
     let balance = wallet.total_balance().await?;
@@ -88,7 +73,7 @@ async fn main() -> Result<(), Error> {
     let prepared_send = wallet
         .prepare_send(10.into(), SendOptions::default())
         .await?;
-    let token = wallet.send(prepared_send, None).await?;
+    let token = prepared_send.confirm(None).await?;
 
     println!("Created token: {}", token);
 
@@ -112,10 +97,15 @@ async fn get_access_token(mint_info: &MintInfo) -> String {
         .expect("Nut21 defined")
         .openid_discovery;
 
-    let oidc_client = OidcClient::new(openid_discovery);
+    let oidc_client = OidcClient::new(openid_discovery, None);
 
     // Get the token endpoint from the OIDC configuration
     let token_url = oidc_client
+        .get_oidc_config()
+        .await
+        .expect("Failed to get OIDC config")
+        .token_endpoint;
+    let client_id = oidc_client
         .get_oidc_config()
         .await
         .expect("Failed to get OIDC config")
@@ -124,7 +114,7 @@ async fn get_access_token(mint_info: &MintInfo) -> String {
     // Create the request parameters
     let params = [
         ("grant_type", "password"),
-        ("client_id", "cashu-client"),
+        ("client_id", &client_id),
         ("username", TEST_USERNAME),
         ("password", TEST_PASSWORD),
     ];

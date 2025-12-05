@@ -9,11 +9,11 @@ use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-#[cfg(feature = "mint")]
-use uuid::Uuid;
 
 use super::nut00::{BlindedMessage, CurrencyUnit, PaymentMethod, Proofs};
 use super::ProofsMethods;
+#[cfg(feature = "mint")]
+use crate::quote_id::QuoteId;
 use crate::Amount;
 
 /// NUT05 Error
@@ -28,6 +28,9 @@ pub enum Error {
     /// Unsupported unit
     #[error("Unsupported unit")]
     UnsupportedUnit,
+    /// Invalid quote id
+    #[error("Invalid quote id")]
+    InvalidQuote,
 }
 
 /// Possible states of a quote
@@ -91,12 +94,12 @@ pub struct MeltRequest<Q> {
 }
 
 #[cfg(feature = "mint")]
-impl TryFrom<MeltRequest<String>> for MeltRequest<Uuid> {
-    type Error = uuid::Error;
+impl TryFrom<MeltRequest<String>> for MeltRequest<QuoteId> {
+    type Error = Error;
 
     fn try_from(value: MeltRequest<String>) -> Result<Self, Self::Error> {
         Ok(Self {
-            quote: Uuid::from_str(&value.quote)?,
+            quote: QuoteId::from_str(&value.quote).map_err(|_e| Error::InvalidQuote)?,
             inputs: value.inputs,
             outputs: value.outputs,
         })
@@ -105,9 +108,19 @@ impl TryFrom<MeltRequest<String>> for MeltRequest<Uuid> {
 
 // Basic implementation without trait bounds
 impl<Q> MeltRequest<Q> {
+    /// Quote Id
+    pub fn quote_id(&self) -> &Q {
+        &self.quote
+    }
+
     /// Get inputs (proofs)
     pub fn inputs(&self) -> &Proofs {
         &self.inputs
+    }
+
+    /// Get mutable inputs (proofs)
+    pub fn inputs_mut(&mut self) -> &mut Proofs {
+        &mut self.inputs
     }
 
     /// Get outputs (blinded messages for change)
@@ -116,7 +129,10 @@ impl<Q> MeltRequest<Q> {
     }
 }
 
-impl<Q: Serialize + DeserializeOwned> MeltRequest<Q> {
+impl<Q> MeltRequest<Q>
+where
+    Q: Serialize + DeserializeOwned,
+{
     /// Create new [`MeltRequest`]
     pub fn new(quote: Q, inputs: Proofs, outputs: Option<Vec<BlindedMessage>>) -> Self {
         Self {
@@ -132,9 +148,44 @@ impl<Q: Serialize + DeserializeOwned> MeltRequest<Q> {
     }
 
     /// Total [`Amount`] of [`Proofs`]
-    pub fn proofs_amount(&self) -> Result<Amount, Error> {
+    pub fn inputs_amount(&self) -> Result<Amount, Error> {
         Amount::try_sum(self.inputs.iter().map(|proof| proof.amount))
             .map_err(|_| Error::AmountOverflow)
+    }
+}
+
+impl<Q> super::nut10::SpendingConditionVerification for MeltRequest<Q>
+where
+    Q: std::fmt::Display,
+{
+    fn inputs(&self) -> &Proofs {
+        &self.inputs
+    }
+
+    fn sig_all_msg_to_sign(&self) -> String {
+        let mut msg = String::new();
+
+        // Add all input secrets and C values in order
+        // msg = secret_0 || C_0 || ... || secret_n || C_n
+        for proof in &self.inputs {
+            msg.push_str(&proof.secret.to_string());
+            msg.push_str(&proof.c.to_hex());
+        }
+
+        // Add all output amounts and B_ values in order (if any)
+        // msg = ... || amount_0 || B_0 || ... || amount_m || B_m
+        if let Some(outputs) = &self.outputs {
+            for output in outputs {
+                msg.push_str(&output.amount.to_string());
+                msg.push_str(&output.blinded_secret.to_hex());
+            }
+        }
+
+        // Add quote ID
+        // msg = ... || quote_id
+        msg.push_str(&self.quote.to_string());
+
+        msg
     }
 }
 
@@ -355,6 +406,18 @@ pub struct Settings {
     pub disabled: bool,
 }
 
+impl Settings {
+    /// Supported nut05 methods
+    pub fn supported_methods(&self) -> Vec<&PaymentMethod> {
+        self.methods.iter().map(|a| &a.method).collect()
+    }
+
+    /// Supported nut05 units
+    pub fn supported_units(&self) -> Vec<&CurrencyUnit> {
+        self.methods.iter().map(|s| &s.unit).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{from_str, json, to_string};
@@ -383,7 +446,7 @@ mod tests {
 
         match settings.options {
             Some(MeltMethodOptions::Bolt11 { amountless }) => {
-                assert_eq!(amountless, true);
+                assert!(amountless);
             }
             _ => panic!("Expected Bolt11 options with amountless = true"),
         }
@@ -415,10 +478,7 @@ mod tests {
 
         match settings.options {
             Some(MeltMethodOptions::Bolt11 { amountless }) => {
-                assert_eq!(
-                    amountless, true,
-                    "Top-level amountless should take precedence"
-                );
+                assert!(amountless, "Top-level amountless should take precedence");
             }
             _ => panic!("Expected Bolt11 options with amountless = true"),
         }

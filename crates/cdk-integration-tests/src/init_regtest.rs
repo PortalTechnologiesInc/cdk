@@ -1,11 +1,16 @@
 use std::env;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use cdk::types::FeeReserve;
 use cdk_cln::Cln as CdkCln;
+use cdk_common::database::mint::DynMintKVStore;
 use cdk_lnd::Lnd as CdkLnd;
+use cdk_sqlite::mint::memory;
+use ldk_node::lightning::ln::msgs::SocketAddress;
+use ldk_node::Node;
 use ln_regtest_rs::bitcoin_client::BitcoinClient;
 use ln_regtest_rs::bitcoind::Bitcoind;
 use ln_regtest_rs::cln::Clnd;
@@ -31,21 +36,41 @@ pub const LND_TWO_RPC_ADDR: &str = "localhost:10010";
 pub const CLN_ADDR: &str = "127.0.0.1:19846";
 pub const CLN_TWO_ADDR: &str = "127.0.0.1:19847";
 
-pub fn get_mint_addr() -> String {
-    env::var("CDK_ITESTS_MINT_ADDR").expect("Mint address not set")
+/// Configuration for regtest environment
+pub struct RegtestConfig {
+    pub mint_addr: String,
+    pub cln_port: u16,
+    pub lnd_port: u16,
+    pub temp_dir: PathBuf,
 }
 
-pub fn get_mint_port(which: &str) -> u16 {
-    let dir = env::var(format!("CDK_ITESTS_MINT_PORT_{which}")).expect("Mint port not set");
-    dir.parse().unwrap()
+impl Default for RegtestConfig {
+    fn default() -> Self {
+        Self {
+            mint_addr: "127.0.0.1".to_string(),
+            cln_port: 8085,
+            lnd_port: 8087,
+            temp_dir: std::env::temp_dir().join("cdk-itests-default"),
+        }
+    }
 }
 
-pub fn get_mint_url(which: &str) -> String {
-    format!("http://{}:{}", get_mint_addr(), get_mint_port(which))
+pub fn get_mint_url_with_config(config: &RegtestConfig, which: &str) -> String {
+    let port = match which {
+        "0" => config.cln_port,
+        "1" => config.lnd_port,
+        _ => panic!("Unknown mint identifier: {which}"),
+    };
+    format!("http://{}:{}", config.mint_addr, port)
 }
 
-pub fn get_mint_ws_url(which: &str) -> String {
-    format!("ws://{}:{}/v1/ws", get_mint_addr(), get_mint_port(which))
+pub fn get_mint_ws_url_with_config(config: &RegtestConfig, which: &str) -> String {
+    let port = match which {
+        "0" => config.cln_port,
+        "1" => config.lnd_port,
+        _ => panic!("Unknown mint identifier: {which}"),
+    };
+    format!("ws://{}:{}/v1/ws", config.mint_addr, port)
 }
 
 pub fn get_temp_dir() -> PathBuf {
@@ -54,15 +79,19 @@ pub fn get_temp_dir() -> PathBuf {
     dir.parse().expect("Valid path buf")
 }
 
-pub fn get_bitcoin_dir() -> PathBuf {
-    let dir = get_temp_dir().join(BITCOIN_DIR);
+pub fn get_temp_dir_with_config(config: &RegtestConfig) -> &PathBuf {
+    &config.temp_dir
+}
+
+pub fn get_bitcoin_dir(temp_dir: &Path) -> PathBuf {
+    let dir = temp_dir.join(BITCOIN_DIR);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-pub fn init_bitcoind() -> Bitcoind {
+pub fn init_bitcoind(work_dir: &Path) -> Bitcoind {
     Bitcoind::new(
-        get_bitcoin_dir(),
+        get_bitcoin_dir(work_dir),
         BITCOIND_ADDR.parse().unwrap(),
         BITCOIN_RPC_USER.to_string(),
         BITCOIN_RPC_PASS.to_string(),
@@ -81,14 +110,14 @@ pub fn init_bitcoin_client() -> Result<BitcoinClient> {
     )
 }
 
-pub fn get_cln_dir(name: &str) -> PathBuf {
-    let dir = get_temp_dir().join("cln").join(name);
+pub fn get_cln_dir(work_dir: &Path, name: &str) -> PathBuf {
+    let dir = work_dir.join("cln").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-pub fn get_lnd_dir(name: &str) -> PathBuf {
-    let dir = get_temp_dir().join("lnd").join(name);
+pub fn get_lnd_dir(work_dir: &Path, name: &str) -> PathBuf {
+    let dir = work_dir.join("lnd").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -101,9 +130,14 @@ pub fn get_lnd_macaroon_path(lnd_dir: &Path) -> PathBuf {
     lnd_dir.join("data/chain/bitcoin/regtest/admin.macaroon")
 }
 
-pub async fn init_lnd(lnd_dir: PathBuf, lnd_addr: &str, lnd_rpc_addr: &str) -> Lnd {
+pub async fn init_lnd(
+    work_dir: &Path,
+    lnd_dir: PathBuf,
+    lnd_addr: &str,
+    lnd_rpc_addr: &str,
+) -> Lnd {
     Lnd::new(
-        get_bitcoin_dir(),
+        get_bitcoin_dir(work_dir),
         lnd_dir,
         lnd_addr.parse().unwrap(),
         lnd_rpc_addr.to_string(),
@@ -116,6 +150,9 @@ pub async fn init_lnd(lnd_dir: PathBuf, lnd_addr: &str, lnd_rpc_addr: &str) -> L
 
 pub fn generate_block(bitcoin_client: &BitcoinClient) -> Result<()> {
     let mine_to_address = bitcoin_client.get_new_address()?;
+    let blocks = 10;
+    tracing::info!("Mining {blocks} blocks to {mine_to_address}");
+
     bitcoin_client.generate_blocks(&mine_to_address, 10)?;
 
     Ok(())
@@ -129,7 +166,8 @@ pub async fn create_cln_backend(cln_client: &ClnClient) -> Result<CdkCln> {
         percent_fee_reserve: 1.0,
     };
 
-    Ok(CdkCln::new(rpc_path, fee_reserve).await?)
+    let kv_store: DynMintKVStore = Arc::new(memory::empty().await?);
+    Ok(CdkCln::new(rpc_path, fee_reserve, kv_store).await?)
 }
 
 pub async fn create_lnd_backend(lnd_client: &LndClient) -> Result<CdkLnd> {
@@ -138,11 +176,14 @@ pub async fn create_lnd_backend(lnd_client: &LndClient) -> Result<CdkLnd> {
         percent_fee_reserve: 1.0,
     };
 
+    let kv_store: DynMintKVStore = Arc::new(memory::empty().await?);
+
     Ok(CdkLnd::new(
         lnd_client.address.clone(),
         lnd_client.cert_file.clone(),
         lnd_client.macaroon_file.clone(),
         fee_reserve,
+        kv_store,
     )
     .await?)
 }
@@ -192,8 +233,13 @@ where
     Ok(())
 }
 
-pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyhow::Result<()> {
-    let mut bitcoind = init_bitcoind();
+pub async fn start_regtest_end(
+    work_dir: &Path,
+    sender: Sender<()>,
+    notify: Arc<Notify>,
+    ldk_node: Option<Arc<Node>>,
+) -> anyhow::Result<()> {
+    let mut bitcoind = init_bitcoind(work_dir);
     bitcoind.start_bitcoind()?;
 
     let bitcoin_client = init_bitcoin_client()?;
@@ -203,9 +249,9 @@ pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyho
     let new_add = bitcoin_client.get_new_address()?;
     bitcoin_client.generate_blocks(&new_add, 200).unwrap();
 
-    let cln_one_dir = get_cln_dir("one");
+    let cln_one_dir = get_cln_dir(work_dir, "one");
     let mut clnd = Clnd::new(
-        get_bitcoin_dir(),
+        get_bitcoin_dir(work_dir),
         cln_one_dir.clone(),
         CLN_ADDR.into(),
         BITCOIN_RPC_USER.to_string(),
@@ -220,9 +266,9 @@ pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyho
     fund_ln(&bitcoin_client, &cln_client).await.unwrap();
 
     // Create second cln
-    let cln_two_dir = get_cln_dir("two");
+    let cln_two_dir = get_cln_dir(work_dir, "two");
     let mut clnd_two = Clnd::new(
-        get_bitcoin_dir(),
+        get_bitcoin_dir(work_dir),
         cln_two_dir.clone(),
         CLN_TWO_ADDR.into(),
         BITCOIN_RPC_USER.to_string(),
@@ -236,10 +282,10 @@ pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyho
 
     fund_ln(&bitcoin_client, &cln_two_client).await.unwrap();
 
-    let lnd_dir = get_lnd_dir("one");
+    let lnd_dir = get_lnd_dir(work_dir, "one");
     println!("{}", lnd_dir.display());
 
-    let mut lnd = init_lnd(lnd_dir.clone(), LND_ADDR, LND_RPC_ADDR).await;
+    let mut lnd = init_lnd(work_dir, lnd_dir.clone(), LND_ADDR, LND_RPC_ADDR).await;
     lnd.start_lnd().unwrap();
     tracing::info!("Started lnd node");
 
@@ -252,11 +298,25 @@ pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyho
 
     lnd_client.wait_chain_sync().await.unwrap();
 
+    if let Some(node) = ldk_node.as_ref() {
+        tracing::info!("Starting ldk node");
+        node.start()?;
+        let addr = node.onchain_payment().new_address().unwrap();
+        bitcoin_client.send_to_address(&addr.to_string(), 5_000_000)?;
+    }
+
     fund_ln(&bitcoin_client, &lnd_client).await.unwrap();
 
     // create second lnd node
-    let lnd_two_dir = get_lnd_dir("two");
-    let mut lnd_two = init_lnd(lnd_two_dir.clone(), LND_TWO_ADDR, LND_TWO_RPC_ADDR).await;
+    let work_dir = get_temp_dir();
+    let lnd_two_dir = get_lnd_dir(&work_dir, "two");
+    let mut lnd_two = init_lnd(
+        &work_dir,
+        lnd_two_dir.clone(),
+        LND_TWO_ADDR,
+        LND_TWO_RPC_ADDR,
+    )
+    .await;
     lnd_two.start_lnd().unwrap();
     tracing::info!("Started second lnd node");
 
@@ -296,11 +356,107 @@ pub async fn start_regtest_end(sender: Sender<()>, notify: Arc<Notify>) -> anyho
         tracing::info!("Opened channel between cln and lnd two");
         generate_block(&bitcoin_client)?;
 
-        cln_client.wait_channels_active().await?;
-        cln_two_client.wait_channels_active().await?;
-        lnd_client.wait_channels_active().await?;
-        lnd_two_client.wait_channels_active().await?;
+        if let Some(node) = ldk_node {
+            let pubkey = node.node_id();
+            let listen_addr = node.listening_addresses();
+            let listen_addr = listen_addr.as_ref().unwrap().first().unwrap();
+
+            let (listen_addr, port) = match listen_addr {
+                SocketAddress::TcpIpV4 { addr, port } => (Ipv4Addr::from(*addr).to_string(), port),
+                _ => panic!(),
+            };
+
+            tracing::info!("Opening channel from cln to ldk");
+
+            cln_client
+                .connect_peer(pubkey.to_string(), listen_addr.clone(), *port)
+                .await?;
+
+            cln_client
+                .open_channel(1_500_000, &pubkey.to_string(), Some(750_000))
+                .await
+                .unwrap();
+
+            generate_block(&bitcoin_client)?;
+
+            let cln_two_info = cln_two_client.get_connect_info().await?;
+
+            cln_client
+                .connect_peer(cln_two_info.pubkey, listen_addr.clone(), cln_two_info.port)
+                .await?;
+
+            tracing::info!("Opening channel from lnd to ldk");
+
+            let cln_info = cln_client.get_connect_info().await?;
+
+            node.connect(
+                cln_info.pubkey.parse()?,
+                SocketAddress::TcpIpV4 {
+                    addr: cln_info
+                        .address
+                        .split('.')
+                        .map(|part| part.parse())
+                        .collect::<Result<Vec<u8>, _>>()?
+                        .try_into()
+                        .unwrap(),
+                    port: cln_info.port,
+                },
+                true,
+            )?;
+
+            let lnd_info = lnd_client.get_connect_info().await?;
+
+            node.connect(
+                lnd_info.pubkey.parse()?,
+                SocketAddress::TcpIpV4 {
+                    addr: [127, 0, 0, 1],
+                    port: lnd_info.port,
+                },
+                true,
+            )?;
+
+            // lnd_client
+            //     .open_channel(1_500_000, &pubkey.to_string(), Some(750_000))
+            //     .await
+            //     .unwrap();
+
+            generate_block(&bitcoin_client)?;
+            lnd_client.wait_chain_sync().await?;
+
+            node.open_announced_channel(
+                lnd_info.pubkey.parse()?,
+                SocketAddress::TcpIpV4 {
+                    addr: [127, 0, 0, 1],
+                    port: lnd_info.port,
+                },
+                1_000_000,
+                Some(500_000_000),
+                None,
+            )?;
+
+            generate_block(&bitcoin_client)?;
+
+            tracing::info!("Ldk channels opened");
+
+            node.sync_wallets()?;
+
+            tracing::info!("Ldk wallet synced");
+
+            cln_client.wait_channels_active().await?;
+
+            lnd_client.wait_channels_active().await?;
+
+            node.stop()?;
+        } else {
+            cln_client.wait_channels_active().await?;
+
+            lnd_client.wait_channels_active().await?;
+
+            generate_block(&bitcoin_client)?;
+        }
     }
+
+    tracing::info!("Regtest channels active");
 
     // Send notification that regtest set up is complete
     sender.send(()).expect("Could not send oneshot");

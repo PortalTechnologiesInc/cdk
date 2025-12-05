@@ -1,10 +1,8 @@
 use std::path::Path;
-use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{CurrencyUnit, MintInfo};
-use cdk::wallet::types::WalletKey;
+use cdk::nuts::MintInfo;
 use cdk::wallet::MultiMintWallet;
 use cdk::OidcClient;
 use clap::Args;
@@ -20,14 +18,6 @@ pub struct CatLoginSubCommand {
     username: String,
     /// Password
     password: String,
-    /// Currency unit e.g. sat
-    #[arg(default_value = "sat")]
-    #[arg(short, long)]
-    unit: String,
-    /// Client ID for OIDC authentication
-    #[arg(default_value = "cashu-client")]
-    #[arg(long)]
-    client_id: String,
 }
 
 pub async fn cat_login(
@@ -36,28 +26,19 @@ pub async fn cat_login(
     work_dir: &Path,
 ) -> Result<()> {
     let mint_url = sub_command_args.mint_url.clone();
-    let unit = CurrencyUnit::from_str(&sub_command_args.unit)?;
 
-    let wallet = match multi_mint_wallet
-        .get_wallet(&WalletKey::new(mint_url.clone(), unit.clone()))
-        .await
-    {
-        Some(wallet) => wallet.clone(),
-        None => {
-            multi_mint_wallet
-                .create_and_add_wallet(&mint_url.to_string(), unit, None)
-                .await?
-        }
-    };
+    // Ensure the mint exists
+    if !multi_mint_wallet.has_mint(&mint_url).await {
+        multi_mint_wallet.add_mint(mint_url.clone()).await?;
+    }
 
-    let mint_info = wallet
-        .get_mint_info()
+    let mint_info = multi_mint_wallet
+        .fetch_mint_info(&mint_url)
         .await?
         .ok_or(anyhow!("Mint info not found"))?;
 
     let (access_token, refresh_token) = get_access_token(
         &mint_info,
-        &sub_command_args.client_id,
         &sub_command_args.username,
         &sub_command_args.password,
     )
@@ -80,12 +61,7 @@ pub async fn cat_login(
     Ok(())
 }
 
-async fn get_access_token(
-    mint_info: &MintInfo,
-    client_id: &str,
-    user: &str,
-    password: &str,
-) -> (String, String) {
+async fn get_access_token(mint_info: &MintInfo, user: &str, password: &str) -> (String, String) {
     let openid_discovery = mint_info
         .nuts
         .nut21
@@ -93,7 +69,14 @@ async fn get_access_token(
         .expect("Nut21 defined")
         .openid_discovery;
 
-    let oidc_client = OidcClient::new(openid_discovery);
+    let client_id = mint_info
+        .nuts
+        .nut21
+        .clone()
+        .expect("Nut21 defined")
+        .client_id;
+
+    let oidc_client = OidcClient::new(openid_discovery, None);
 
     // Get the token endpoint from the OIDC configuration
     let token_url = oidc_client
@@ -105,7 +88,8 @@ async fn get_access_token(
     // Create the request parameters
     let params = [
         ("grant_type", "password"),
-        ("client_id", client_id),
+        ("client_id", &client_id),
+        ("scope", "openid offline_access"),
         ("username", user),
         ("password", password),
     ];

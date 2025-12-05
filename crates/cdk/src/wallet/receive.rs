@@ -26,23 +26,15 @@ impl Wallet {
         opts: ReceiveOptions,
         memo: Option<String>,
     ) -> Result<Amount, Error> {
+        // Incase the wallet is getting ecash for the first time
+        // we want to get the mint info for our db
+        let _mint_info = self.load_mint_info().await?;
+
         let mint_url = &self.mint_url;
-        // Add mint if it does not exist in the store
-        if self
-            .localstore
-            .get_mint(self.mint_url.clone())
-            .await?
-            .is_none()
-        {
-            tracing::debug!("Mint not in localstore fetching info for: {mint_url}");
-            self.get_mint_info().await?;
-        }
 
-        let _ = self.get_active_mint_keyset().await?;
+        let active_keyset_id = self.fetch_active_keyset().await?.id;
 
-        let active_keyset_id = self.get_active_mint_keyset().await?.id;
-
-        let keys = self.get_keyset_keys(active_keyset_id).await?;
+        let keys = self.load_keyset_keys(active_keyset_id).await?;
 
         let mut proofs = proofs;
 
@@ -70,7 +62,7 @@ impl Wallet {
         for proof in &mut proofs {
             // Verify that proof DLEQ is valid
             if proof.dleq.is_some() {
-                let keys = self.get_keyset_keys(proof.keyset_id).await?;
+                let keys = self.load_keyset_keys(proof.keyset_id).await?;
                 let key = keys.amount_key(proof.amount).ok_or(Error::AmountKey)?;
                 proof.verify_dleq(key)?;
             }
@@ -138,7 +130,12 @@ impl Wallet {
             }
         }
 
-        let swap_response = self.client.post_swap(pre_swap.swap_request).await?;
+        let swap_response = self
+            .try_proof_operation_or_reclaim(
+                pre_swap.swap_request.inputs().clone(),
+                self.client.post_swap(pre_swap.swap_request),
+            )
+            .await?;
 
         // Proof to keep
         let recv_proofs = construct_proofs(
@@ -177,6 +174,9 @@ impl Wallet {
                 timestamp: unix_time(),
                 memo,
                 metadata: opts.metadata,
+                quote_id: None,
+                payment_request: None,
+                payment_proof: None,
             })
             .await?;
 
@@ -196,12 +196,12 @@ impl Wallet {
     ///
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
-    ///  let seed = random::<[u8; 32]>();
+    ///  let seed = random::<[u8; 64]>();
     ///  let mint_url = "https://fake.thesimplekid.dev";
     ///  let unit = CurrencyUnit::Sat;
     ///
     ///  let localstore = memory::empty().await?;
-    ///  let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), &seed, None).unwrap();
+    ///  let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None).unwrap();
     ///  let token = "cashuAeyJ0b2tlbiI6W3sicHJvb2ZzIjpbeyJhbW91bnQiOjEsInNlY3JldCI6ImI0ZjVlNDAxMDJhMzhiYjg3NDNiOTkwMzU5MTU1MGYyZGEzZTQxNWEzMzU0OTUyN2M2MmM5ZDc5MGVmYjM3MDUiLCJDIjoiMDIzYmU1M2U4YzYwNTMwZWVhOWIzOTQzZmRhMWEyY2U3MWM3YjNmMGNmMGRjNmQ4NDZmYTc2NWFhZjc3OWZhODFkIiwiaWQiOiIwMDlhMWYyOTMyNTNlNDFlIn1dLCJtaW50IjoiaHR0cHM6Ly90ZXN0bnV0LmNhc2h1LnNwYWNlIn1dLCJ1bml0Ijoic2F0In0=";
     ///  let amount_receive = wallet.receive(token, ReceiveOptions::default()).await?;
     ///  Ok(())
@@ -249,12 +249,12 @@ impl Wallet {
     ///
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
-    ///  let seed = random::<[u8; 32]>();
+    ///  let seed = random::<[u8; 64]>();
     ///  let mint_url = "https://fake.thesimplekid.dev";
     ///  let unit = CurrencyUnit::Sat;
     ///
     ///  let localstore = memory::empty().await?;
-    ///  let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), &seed, None).unwrap();
+    ///  let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None).unwrap();
     ///  let token_raw = hex::decode("6372617742a4617481a261694800ad268c4d1f5826617081a3616101617378403961366462623834376264323332626137366462306466313937323136623239643362386363313435353363643237383237666331636339343266656462346561635821038618543ffb6b8695df4ad4babcde92a34a96bdcd97dcee0d7ccf98d4721267926164695468616e6b20796f75616d75687474703a2f2f6c6f63616c686f73743a33333338617563736174").unwrap();
     ///  let amount_receive = wallet.receive_raw(&token_raw, ReceiveOptions::default()).await?;
     ///  Ok(())

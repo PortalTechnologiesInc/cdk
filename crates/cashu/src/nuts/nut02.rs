@@ -445,18 +445,17 @@ pub struct KeySet {
 impl KeySet {
     /// Verify the keyset id matches keys
     pub fn verify_id(&self) -> Result<(), Error> {
-        match self.id.version {
-            KeySetVersion::Version00 => {
-                let keys_id: Id = Id::v1_from_keys(&self.keys);
+        let keys_id = match self.id.version {
+            KeySetVersion::Version00 => Id::v1_from_keys(&self.keys),
+            KeySetVersion::Version01 => Id::v2_from_data(&self.keys, &self.unit, self.final_expiry),
+        };
 
-                ensure_cdk!(keys_id == self.id, Error::IncorrectKeysetId);
-            }
-            KeySetVersion::Version01 => {
-                let keys_id: Id = Id::v2_from_data(&self.keys, &self.unit, self.final_expiry);
+        ensure_cdk!(
+            u32::from(keys_id) == u32::from(self.id),
+            Error::IncorrectKeysetId
+        );
 
-                ensure_cdk!(keys_id == self.id, Error::IncorrectKeysetId);
-            }
-        }
+        ensure_cdk!(keys_id == self.id, Error::IncorrectKeysetId);
 
         Ok(())
     }
@@ -497,6 +496,28 @@ pub struct KeySetInfo {
     pub final_expiry: Option<u64>,
 }
 
+/// List of [KeySetInfo]
+pub type KeySetInfos = Vec<KeySetInfo>;
+
+/// Utility methods for [KeySetInfos]
+pub trait KeySetInfosMethods {
+    /// Filter for active keysets
+    fn active(&self) -> impl Iterator<Item = &KeySetInfo> + '_;
+
+    /// Filter keysets for specific unit
+    fn unit(&self, unit: CurrencyUnit) -> impl Iterator<Item = &KeySetInfo> + '_;
+}
+
+impl KeySetInfosMethods for KeySetInfos {
+    fn active(&self) -> impl Iterator<Item = &KeySetInfo> + '_ {
+        self.iter().filter(|k| k.active)
+    }
+
+    fn unit(&self, unit: CurrencyUnit) -> impl Iterator<Item = &KeySetInfo> + '_ {
+        self.iter().filter(move |k| k.unit == unit)
+    }
+}
+
 fn deserialize_input_fee_ppk<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -532,13 +553,12 @@ impl MintKeySet {
         secp: &Secp256k1<C>,
         xpriv: Xpriv,
         unit: CurrencyUnit,
-        max_order: u8,
+        amounts: &[u64],
         final_expiry: Option<u64>,
         version: KeySetVersion,
     ) -> Self {
         let mut map = BTreeMap::new();
-        for i in 0..max_order {
-            let amount = Amount::from(2_u64.pow(i as u32));
+        for (i, amount) in amounts.iter().enumerate() {
             let secret_key = xpriv
                 .derive_priv(
                     secp,
@@ -548,7 +568,7 @@ impl MintKeySet {
                 .private_key;
             let public_key = secret_key.public_key(secp);
             map.insert(
-                amount,
+                amount.into(),
                 MintKeyPair {
                     secret_key: secret_key.into(),
                     public_key: public_key.into(),
@@ -573,7 +593,7 @@ impl MintKeySet {
     pub fn generate_from_seed<C: secp256k1::Signing>(
         secp: &Secp256k1<C>,
         seed: &[u8],
-        max_order: u8,
+        amounts: &[u64],
         currency_unit: CurrencyUnit,
         derivation_path: DerivationPath,
         final_expiry: Option<u64>,
@@ -586,7 +606,7 @@ impl MintKeySet {
                 .derive_priv(secp, &derivation_path)
                 .expect("RNG busted"),
             currency_unit,
-            max_order,
+            amounts,
             final_expiry,
             version,
         )
@@ -596,7 +616,7 @@ impl MintKeySet {
     pub fn generate_from_xpriv<C: secp256k1::Signing>(
         secp: &Secp256k1<C>,
         xpriv: Xpriv,
-        max_order: u8,
+        amounts: &[u64],
         currency_unit: CurrencyUnit,
         derivation_path: DerivationPath,
         final_expiry: Option<u64>,
@@ -608,7 +628,7 @@ impl MintKeySet {
                 .derive_priv(secp, &derivation_path)
                 .expect("RNG busted"),
             currency_unit,
-            max_order,
+            amounts,
             final_expiry,
             version,
         )

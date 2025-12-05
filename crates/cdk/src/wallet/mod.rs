@@ -1,17 +1,22 @@
 #![doc = include_str!("./README.md")]
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
-use bitcoin::bip32::Xpriv;
+use cdk_common::amount::FeeAndAmounts;
 use cdk_common::database::{self, WalletDatabase};
-use cdk_common::subscription::Params;
+use cdk_common::parking_lot::RwLock;
+use cdk_common::subscription::WalletParams;
 use getrandom::getrandom;
 use subscription::{ActiveSubscription, SubscriptionManager};
 #[cfg(feature = "auth")]
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as TokioRwLock;
 use tracing::instrument;
+use zeroize::Zeroize;
 
 use crate::amount::SplitTarget;
 use crate::dhke::construct_proofs;
@@ -26,22 +31,31 @@ use crate::nuts::{
 };
 use crate::types::ProofInfo;
 use crate::util::unix_time;
+use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::Amount;
+use cdk_common::common::UnitMetadata;
 #[cfg(feature = "auth")]
 use crate::OidcClient;
 
 #[cfg(feature = "auth")]
 mod auth;
+#[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+pub use mint_connector::TorHttpClient;
 mod balance;
 mod builder;
+mod issue;
 mod keysets;
 mod melt;
-mod mint;
 mod mint_connector;
+mod mint_metadata_cache;
 pub mod multi_mint_wallet;
+pub mod payment_request;
 mod proofs;
 mod receive;
+mod reclaim;
 mod send;
+#[cfg(not(target_arch = "wasm32"))]
+mod streams;
 pub mod subscription;
 mod swap;
 mod transactions;
@@ -52,9 +66,13 @@ pub use auth::{AuthMintConnector, AuthWallet};
 pub use builder::WalletBuilder;
 pub use cdk_common::wallet as types;
 #[cfg(feature = "auth")]
+pub use mint_connector::http_client::AuthHttpClient as BaseAuthHttpClient;
+pub use mint_connector::http_client::HttpClient as BaseHttpClient;
+pub use mint_connector::transport::Transport as HttpTransport;
+#[cfg(feature = "auth")]
 pub use mint_connector::AuthHttpClient;
-pub use mint_connector::{HttpClient, MintConnector};
-pub use multi_mint_wallet::MultiMintWallet;
+pub use mint_connector::{HttpClient, LnurlPayInvoiceResponse, LnurlPayResponse, MintConnector};
+pub use multi_mint_wallet::{MultiMintReceiveOptions, MultiMintSendOptions, MultiMintWallet};
 pub use receive::ReceiveOptions;
 pub use send::{PreparedSend, SendMemo, SendOptions};
 pub use types::{MeltQuote, MintQuote, SendKind};
@@ -74,13 +92,17 @@ pub struct Wallet {
     pub unit: CurrencyUnit,
     /// Storage backend
     pub localstore: Arc<dyn WalletDatabase<Err = database::Error> + Send + Sync>,
+    /// Mint metadata cache for this mint (lock-free cached access to keys, keysets, and mint info)
+    pub metadata_cache: Arc<MintMetadataCache>,
     /// The targeted amount of proofs to have at each size
     pub target_proof_count: usize,
+    metadata_cache_ttl: Arc<RwLock<Option<Duration>>>,
     #[cfg(feature = "auth")]
-    auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
-    xpriv: Xpriv,
+    auth_wallet: Arc<TokioRwLock<Option<AuthWallet>>>,
+    seed: [u8; 64],
     client: Arc<dyn MintConnector + Send + Sync>,
     subscription: SubscriptionManager,
+    in_error_swap_reverted_proofs: Arc<AtomicBool>,
 }
 
 const ALPHANUMERIC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -94,37 +116,46 @@ pub enum WalletSubscription {
     Bolt11MintQuoteState(Vec<String>),
     /// Melt quote subscription
     Bolt11MeltQuoteState(Vec<String>),
+    /// Mint bolt12 quote subscription
+    Bolt12MintQuoteState(Vec<String>),
 }
 
-impl From<WalletSubscription> for Params {
+impl From<WalletSubscription> for WalletParams {
     fn from(val: WalletSubscription) -> Self {
         let mut buffer = vec![0u8; 10];
 
         getrandom(&mut buffer).expect("Failed to generate random bytes");
 
-        let id = buffer
-            .iter()
-            .map(|&byte| {
-                let index = byte as usize % ALPHANUMERIC.len(); // 62 alphanumeric characters (A-Z, a-z, 0-9)
-                ALPHANUMERIC[index] as char
-            })
-            .collect::<String>();
+        let id = Arc::new(
+            buffer
+                .iter()
+                .map(|&byte| {
+                    let index = byte as usize % ALPHANUMERIC.len(); // 62 alphanumeric characters (A-Z, a-z, 0-9)
+                    ALPHANUMERIC[index] as char
+                })
+                .collect::<String>(),
+        );
 
         match val {
-            WalletSubscription::ProofState(filters) => Params {
+            WalletSubscription::ProofState(filters) => WalletParams {
                 filters,
                 kind: Kind::ProofState,
-                id: id.into(),
+                id,
             },
-            WalletSubscription::Bolt11MintQuoteState(filters) => Params {
+            WalletSubscription::Bolt11MintQuoteState(filters) => WalletParams {
                 filters,
                 kind: Kind::Bolt11MintQuote,
-                id: id.into(),
+                id,
             },
-            WalletSubscription::Bolt11MeltQuoteState(filters) => Params {
+            WalletSubscription::Bolt11MeltQuoteState(filters) => WalletParams {
                 filters,
                 kind: Kind::Bolt11MeltQuote,
-                id: id.into(),
+                id,
+            },
+            WalletSubscription::Bolt12MintQuoteState(filters) => WalletParams {
+                filters,
+                kind: Kind::Bolt12MintQuote,
+                id,
             },
         }
     }
@@ -143,7 +174,7 @@ impl Wallet {
     /// use rand::random;
     ///
     /// async fn test() -> anyhow::Result<()> {
-    ///     let seed = random::<[u8; 32]>();
+    ///     let seed = random::<[u8; 64]>();
     ///     let mint_url = "https://fake.thesimplekid.dev";
     ///     let unit = CurrencyUnit::Sat;
     ///
@@ -152,7 +183,7 @@ impl Wallet {
     ///         .mint_url(mint_url.parse().unwrap())
     ///         .unit(unit)
     ///         .localstore(Arc::new(localstore))
-    ///         .seed(&seed)
+    ///         .seed(seed)
     ///         .build();
     ///     Ok(())
     /// }
@@ -161,7 +192,7 @@ impl Wallet {
         mint_url: &str,
         unit: CurrencyUnit,
         localstore: Arc<dyn WalletDatabase<Err = database::Error> + Send + Sync>,
-        seed: &[u8],
+        seed: [u8; 64],
         target_proof_count: Option<usize>,
     ) -> Result<Self, Error> {
         let mint_url = MintUrl::from_str(mint_url)?;
@@ -176,10 +207,10 @@ impl Wallet {
     }
 
     /// Subscribe to events
-    pub async fn subscribe<T: Into<Params>>(&self, query: T) -> ActiveSubscription {
+    pub async fn subscribe<T: Into<WalletParams>>(&self, query: T) -> ActiveSubscription {
         self.subscription
-            .subscribe(self.mint_url.clone(), query.into(), Arc::new(self.clone()))
-            .await
+            .subscribe(self.mint_url.clone(), query.into())
+            .expect("FIXME")
     }
 
     /// Fee required for proof set
@@ -195,12 +226,18 @@ impl Wallet {
         proofs_per_keyset: HashMap<Id, u64>,
     ) -> Result<Amount, Error> {
         let mut fee_per_keyset = HashMap::new();
+        let metadata = self
+            .metadata_cache
+            .load(&self.localstore, &self.client, {
+                let ttl = self.metadata_cache_ttl.read();
+                *ttl
+            })
+            .await?;
 
         for keyset_id in proofs_per_keyset.keys() {
-            let mint_keyset_info = self
-                .localstore
-                .get_keyset_by_id(keyset_id)
-                .await?
+            let mint_keyset_info = metadata
+                .keysets
+                .get(keyset_id)
                 .ok_or(Error::UnknownKeySet)?;
             fee_per_keyset.insert(*keyset_id, mint_keyset_info.input_fee_ppk);
         }
@@ -214,9 +251,14 @@ impl Wallet {
     #[instrument(skip_all)]
     pub async fn get_keyset_count_fee(&self, keyset_id: &Id, count: u64) -> Result<Amount, Error> {
         let input_fee_ppk = self
-            .localstore
-            .get_keyset_by_id(keyset_id)
+            .metadata_cache
+            .load(&self.localstore, &self.client, {
+                let ttl = self.metadata_cache_ttl.read();
+                *ttl
+            })
             .await?
+            .keysets
+            .get(keyset_id)
             .ok_or(Error::UnknownKeySet)?
             .input_fee_ppk;
 
@@ -242,101 +284,121 @@ impl Wallet {
 
     /// Query mint for current mint information
     #[instrument(skip(self))]
-    pub async fn get_mint_info(&self) -> Result<Option<MintInfo>, Error> {
-        match self.client.get_mint_info().await {
-            Ok(mint_info) => {
-                // If mint provides time make sure it is accurate
-                if let Some(mint_unix_time) = mint_info.time {
-                    let current_unix_time = unix_time();
-                    if current_unix_time.abs_diff(mint_unix_time) > 30 {
-                        tracing::warn!(
-                            "Mint time does match wallet time. Mint: {}, Wallet: {}",
-                            mint_unix_time,
-                            current_unix_time
-                        );
-                        return Err(Error::MintTimeExceedsTolerance);
-                    }
-                }
+    pub async fn fetch_mint_info(&self) -> Result<Option<MintInfo>, Error> {
+        let mint_info = self
+            .metadata_cache
+            .load_from_mint(&self.localstore, &self.client)
+            .await?
+            .mint_info
+            .clone();
 
-                // Create or update auth wallet
-                #[cfg(feature = "auth")]
-                {
-                    let mut auth_wallet = self.auth_wallet.write().await;
-                    match &*auth_wallet {
-                        Some(auth_wallet) => {
-                            let mut protected_endpoints =
-                                auth_wallet.protected_endpoints.write().await;
-                            *protected_endpoints = mint_info.protected_endpoints();
-
-                            if let Some(oidc_client) =
-                                mint_info.openid_discovery().map(OidcClient::new)
-                            {
-                                auth_wallet.set_oidc_client(Some(oidc_client)).await;
-                            }
-                        }
-                        None => {
-                            tracing::info!("Mint has auth enabled creating auth wallet");
-
-                            let oidc_client = mint_info.openid_discovery().map(OidcClient::new);
-                            let new_auth_wallet = AuthWallet::new(
-                                self.mint_url.clone(),
-                                None,
-                                self.localstore.clone(),
-                                mint_info.protected_endpoints(),
-                                oidc_client,
-                            );
-                            *auth_wallet = Some(new_auth_wallet.clone());
-
-                            self.client.set_auth_wallet(Some(new_auth_wallet)).await;
-                        }
-                    }
-                }
-
-                self.localstore
-                    .add_mint(self.mint_url.clone(), Some(mint_info.clone()))
-                    .await?;
-
-                tracing::trace!("Mint info updated for {}", self.mint_url);
-
-                Ok(Some(mint_info))
-            }
-            Err(err) => {
-                tracing::warn!("Could not get mint info {}", err);
-                Ok(None)
+        // If mint provides time make sure it is accurate
+        if let Some(mint_unix_time) = mint_info.time {
+            let current_unix_time = unix_time();
+            if current_unix_time.abs_diff(mint_unix_time) > 30 {
+                tracing::warn!(
+                    "Mint time does match wallet time. Mint: {}, Wallet: {}",
+                    mint_unix_time,
+                    current_unix_time
+                );
+                return Err(Error::MintTimeExceedsTolerance);
             }
         }
+
+        // Create or update auth wallet
+        #[cfg(feature = "auth")]
+        {
+            let mut auth_wallet = self.auth_wallet.write().await;
+            match &*auth_wallet {
+                Some(auth_wallet) => {
+                    let mut protected_endpoints = auth_wallet.protected_endpoints.write().await;
+                    *protected_endpoints = mint_info.protected_endpoints();
+
+                    if let Some(oidc_client) = mint_info
+                        .openid_discovery()
+                        .map(|url| OidcClient::new(url, None))
+                    {
+                        auth_wallet.set_oidc_client(Some(oidc_client)).await;
+                    }
+                }
+                None => {
+                    tracing::info!("Mint has auth enabled creating auth wallet");
+
+                    let oidc_client = mint_info
+                        .openid_discovery()
+                        .map(|url| OidcClient::new(url, None));
+                    let new_auth_wallet = AuthWallet::new(
+                        self.mint_url.clone(),
+                        None,
+                        self.localstore.clone(),
+                        self.metadata_cache.clone(),
+                        mint_info.protected_endpoints(),
+                        oidc_client,
+                    );
+                    *auth_wallet = Some(new_auth_wallet.clone());
+
+                    self.client.set_auth_wallet(Some(new_auth_wallet)).await;
+                }
+            }
+        }
+
+        tracing::trace!("Mint info updated for {}", self.mint_url);
+
+        Ok(Some(mint_info))
+    }
+
+    /// Load mint info from cache
+    ///
+    /// This is a helper function that loads the mint info from the metadata cache
+    /// using the configured TTL. Unlike `fetch_mint_info()`, this does not make
+    /// a network call if the cache is fresh.
+    #[instrument(skip(self))]
+    pub async fn load_mint_info(&self) -> Result<MintInfo, Error> {
+        let mint_info = self
+            .metadata_cache
+            .load(&self.localstore, &self.client, {
+                let ttl = self.metadata_cache_ttl.read();
+                *ttl
+            })
+            .await?
+            .mint_info
+            .clone();
+
+        Ok(mint_info)
     }
 
     /// Get amounts needed to refill proof state
     #[instrument(skip(self))]
-    pub async fn amounts_needed_for_state_target(&self) -> Result<Vec<Amount>, Error> {
+    pub async fn amounts_needed_for_state_target(
+        &self,
+        fee_and_amounts: &FeeAndAmounts,
+    ) -> Result<Vec<Amount>, Error> {
         let unspent_proofs = self.get_unspent_proofs().await?;
 
-        let amounts_count: HashMap<usize, usize> =
+        let amounts_count: HashMap<u64, u64> =
             unspent_proofs
                 .iter()
                 .fold(HashMap::new(), |mut acc, proof| {
                     let amount = proof.amount;
-                    let counter = acc.entry(u64::from(amount) as usize).or_insert(0);
+                    let counter = acc.entry(u64::from(amount)).or_insert(0);
                     *counter += 1;
                     acc
                 });
 
-        let all_possible_amounts: Vec<usize> = (0..32).map(|i| 2usize.pow(i as u32)).collect();
+        let needed_amounts =
+            fee_and_amounts
+                .amounts()
+                .iter()
+                .fold(Vec::new(), |mut acc, amount| {
+                    let count_needed = (self.target_proof_count as u64)
+                        .saturating_sub(*amounts_count.get(amount).unwrap_or(&0));
 
-        let needed_amounts = all_possible_amounts
-            .iter()
-            .fold(Vec::new(), |mut acc, amount| {
-                let count_needed: usize = self
-                    .target_proof_count
-                    .saturating_sub(*amounts_count.get(amount).unwrap_or(&0));
+                    for _i in 0..count_needed {
+                        acc.push(Amount::from(*amount));
+                    }
 
-                for _i in 0..count_needed {
-                    acc.push(Amount::from(*amount as u64));
-                }
-
-                acc
-            });
+                    acc
+                });
         Ok(needed_amounts)
     }
 
@@ -345,8 +407,11 @@ impl Wallet {
     async fn determine_split_target_values(
         &self,
         change_amount: Amount,
+        fee_and_amounts: &FeeAndAmounts,
     ) -> Result<SplitTarget, Error> {
-        let mut amounts_needed_refill = self.amounts_needed_for_state_target().await?;
+        let mut amounts_needed_refill = self
+            .amounts_needed_for_state_target(fee_and_amounts)
+            .await?;
 
         amounts_needed_refill.sort();
 
@@ -372,22 +437,22 @@ impl Wallet {
             .await?
             .is_none()
         {
-            self.get_mint_info().await?;
+            self.fetch_mint_info().await?;
         }
 
-        let keysets = self.get_mint_keysets().await?;
+        let keysets = self.load_mint_keysets().await?;
 
         let mut restored_value = Amount::ZERO;
 
         for keyset in keysets {
-            let keys = self.get_keyset_keys(keyset.id).await?;
+            let keys = self.load_keyset_keys(keyset.id).await?;
             let mut empty_batch = 0;
             let mut start_counter = 0;
 
             while empty_batch.lt(&3) {
                 let premint_secrets = PreMintSecrets::restore_batch(
                     keyset.id,
-                    self.xpriv,
+                    &self.seed,
                     start_counter,
                     start_counter + 100,
                 )?;
@@ -629,7 +694,7 @@ impl Wallet {
             let mint_pubkey = match keys_cache.get(&proof.keyset_id) {
                 Some(keys) => keys.amount_key(proof.amount),
                 None => {
-                    let keys = self.get_keyset_keys(proof.keyset_id).await?;
+                    let keys = self.load_keyset_keys(proof.keyset_id).await?;
 
                     let key = keys.amount_key(proof.amount);
                     keys_cache.insert(proof.keyset_id, keys);
@@ -645,5 +710,33 @@ impl Wallet {
         }
 
         Ok(())
+    }
+
+    /// Set the client (MintConnector) for this wallet
+    ///
+    /// This allows updating the connector without recreating the wallet.
+    pub fn set_client(&mut self, client: Arc<dyn MintConnector + Send + Sync>) {
+        self.client = client;
+    }
+
+    /// Set the target proof count for this wallet
+    ///
+    /// This controls how many proofs of each denomination the wallet tries to maintain.
+    pub fn set_target_proof_count(&mut self, count: usize) {
+        self.target_proof_count = count;
+    }
+
+    /// Get unit metadata from the mint
+    ///
+    /// Fetches the unit metadata for this wallet's currency unit from the mint's HTTP endpoint.
+    #[instrument(skip(self))]
+    pub async fn get_unit_metadata(&self) -> Result<UnitMetadata, Error> {
+        self.client.get_unit_metadata(self.unit.clone()).await
+    }
+}
+
+impl Drop for Wallet {
+    fn drop(&mut self) {
+        self.seed.zeroize();
     }
 }

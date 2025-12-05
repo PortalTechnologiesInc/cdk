@@ -66,7 +66,7 @@ use tokio::time::sleep;
 async fn main() {
     #[cfg(feature = "wallet")]
     {
-        let seed = random::<[u8; 32]>();
+        let seed = random::<[u8; 64]>();
 
         let mint_url = "https://fake.thesimplekid.dev";
         let unit = CurrencyUnit::Sat;
@@ -74,7 +74,7 @@ async fn main() {
 
         let localstore = memory::empty().await.unwrap();
 
-        let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), &seed, None).unwrap();
+        let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None).unwrap();
 
         let quote = wallet.mint_quote(amount, None).await.unwrap();
 
@@ -101,7 +101,7 @@ async fn main() {
 
         // Send the token
         let prepared_send = wallet.prepare_send(Amount::ONE, SendOptions::default()).await.unwrap();
-        let token = wallet.send(prepared_send, None).await.unwrap();
+        let token = prepared_send.confirm(None).await.unwrap();
 
         println!("{}", token);
     }

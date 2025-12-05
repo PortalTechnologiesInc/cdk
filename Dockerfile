@@ -10,10 +10,10 @@ COPY Cargo.toml ./Cargo.toml
 COPY crates ./crates
 
 # Start the Nix daemon and develop the environment
-RUN nix develop --extra-experimental-features nix-command --extra-experimental-features flakes --command cargo build --release --bin cdk-mintd --features redis
+RUN nix develop --extra-experimental-features nix-command --extra-experimental-features flakes --command cargo build --release --bin cdk-mintd --features postgres --features prometheus
 
 # Create a runtime stage
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Set the working directory
 WORKDIR /usr/src/app

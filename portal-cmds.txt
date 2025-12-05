@@ -1,0 +1,15 @@
+
+
+cargo run -p cdk-cli -- --unit casa balance --unit casa
+
+cargo run -p cdk-cli -- --unit casa mint "http://127.0.0.1:8085" 100 "my real mint"
+
+cargo run -p cdk-cli -- --unit casa send 
+
+
+
+curl -v -X POST "http://localhost:8085/v1/mint/quote/bolt11" -H "Content-Type: application/json" -H "Clear-auth: my-static-token" -d '{ "amount": 1000,"unit": "casa" }'
+
+
+
+curl -v -X POST "http://localhost:8085/v1/mint/quote/bolt11" -H "Content-Type: application/json" -H "Clear-auth: no-token" -d '{ "amount": 1000,"unit": "casa" }'

@@ -43,7 +43,7 @@ pub struct RotateKeyArguments {
     /// Unit
     pub unit: CurrencyUnit,
     /// Max order
-    pub max_order: u8,
+    pub amounts: Vec<u64>,
     /// Input fee
     pub input_fee_ppk: u64,
 }
@@ -71,6 +71,8 @@ pub struct SignatoryKeySet {
     pub active: bool,
     /// The list of public keys
     pub keys: Keys,
+    /// Amounts supported by the keyset
+    pub amounts: Vec<u64>,
     /// Information about the fee per public key
     pub input_fee_ppk: u64,
     /// Final expiry of the keyset (unix timestamp in the future)
@@ -109,7 +111,7 @@ impl From<SignatoryKeySet> for MintKeySetInfo {
             input_fee_ppk: val.input_fee_ppk,
             derivation_path: Default::default(),
             derivation_path_index: Default::default(),
-            max_order: 0,
+            amounts: val.amounts,
             final_expiry: val.final_expiry,
             valid_from: 0,
         }
@@ -123,6 +125,7 @@ impl From<&(MintKeySetInfo, MintKeySet)> for SignatoryKeySet {
             unit: key.unit.clone(),
             active: info.active,
             input_fee_ppk: info.input_fee_ppk,
+            amounts: info.amounts.clone(),
             keys: key.keys.clone().into(),
             final_expiry: key.final_expiry,
         }
@@ -132,7 +135,7 @@ impl From<&(MintKeySetInfo, MintKeySet)> for SignatoryKeySet {
 #[async_trait::async_trait]
 /// Signatory trait
 pub trait Signatory {
-    /// The Signatory implementation name. This may be exposed, so being as discreet as possible is
+    /// The Signatory implementation name. This may be exposed, so being as discrete as possible is
     /// advised.
     fn name(&self) -> String;
 
@@ -144,7 +147,7 @@ pub trait Signatory {
         blinded_messages: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error>;
 
-    /// Verify [`Proof`] meets conditions and is signed
+    /// Verify [`Proof`] meets conditions and is signed by the mint (ignores P2PK/HTLC signatures"
     async fn verify_proofs(&self, proofs: Vec<Proof>) -> Result<(), Error>;
 
     /// Retrieve the list of all mint keysets

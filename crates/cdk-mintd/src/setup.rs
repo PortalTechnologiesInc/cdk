@@ -1,22 +1,25 @@
-#[cfg(feature = "fakewallet")]
+#[cfg(any(feature = "fakewallet", feature = "portalwallet"))]
 use std::collections::HashMap;
-#[cfg(feature = "fakewallet")]
+#[cfg(any(feature = "fakewallet", feature = "portalwallet"))]
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(feature = "cln")]
 use anyhow::anyhow;
+#[cfg(any(feature = "lnbits", feature = "lnd"))]
+use anyhow::bail;
 use async_trait::async_trait;
-use axum::Router;
 #[cfg(feature = "fakewallet")]
 use bip39::rand::{thread_rng, Rng};
+use cdk::cdk_database::MintKVStore;
 use cdk::cdk_payment::MintPayment;
-#[cfg(feature = "lnbits")]
-use cdk::mint_url::MintUrl;
 use cdk::nuts::CurrencyUnit;
 #[cfg(any(
     feature = "lnbits",
     feature = "cln",
     feature = "lnd",
+    feature = "ldk-node",
     feature = "fakewallet"
 ))]
 use cdk::types::FeeReserve;
@@ -29,9 +32,11 @@ use crate::expand_path;
 pub trait LnBackendSetup {
     async fn setup(
         &self,
-        routers: &mut Vec<Router>,
         settings: &Settings,
         unit: CurrencyUnit,
+        runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        work_dir: &Path,
+        kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<impl MintPayment>;
 }
 
@@ -40,10 +45,19 @@ pub trait LnBackendSetup {
 impl LnBackendSetup for config::Cln {
     async fn setup(
         &self,
-        _routers: &mut Vec<Router>,
         _settings: &Settings,
         _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_cln::Cln> {
+        // Validate required connection field
+        if self.rpc_path.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "CLN rpc_path must be set via config or CDK_MINTD_CLN_RPC_PATH env var"
+            ));
+        }
+
         let cln_socket = expand_path(
             self.rpc_path
                 .to_str()
@@ -56,7 +70,12 @@ impl LnBackendSetup for config::Cln {
             percent_fee_reserve: self.fee_percent,
         };
 
-        let cln = cdk_cln::Cln::new(cln_socket, fee_reserve).await?;
+        let cln = cdk_cln::Cln::new(
+            cln_socket,
+            fee_reserve,
+            kv_store.expect("Cln needs kv store"),
+        )
+        .await?;
 
         Ok(cln)
     }
@@ -67,33 +86,31 @@ impl LnBackendSetup for config::Cln {
 impl LnBackendSetup for config::LNbits {
     async fn setup(
         &self,
-        routers: &mut Vec<Router>,
-        settings: &Settings,
+        _settings: &Settings,
         _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        _kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_lnbits::LNbits> {
+        // Validate required connection fields
+        if self.admin_api_key.is_empty() {
+            bail!("LNbits admin_api_key must be set via config or CDK_MINTD_LNBITS_ADMIN_API_KEY env var");
+        }
+        if self.invoice_api_key.is_empty() {
+            bail!("LNbits invoice_api_key must be set via config or CDK_MINTD_LNBITS_INVOICE_API_KEY env var");
+        }
+        if self.lnbits_api.is_empty() {
+            bail!(
+                "LNbits lnbits_api must be set via config or CDK_MINTD_LNBITS_LNBITS_API env var"
+            );
+        }
+
         let admin_api_key = &self.admin_api_key;
         let invoice_api_key = &self.invoice_api_key;
-
-        // Channel used for lnbits web hook
-        let webhook_endpoint = "/webhook/lnbits/sat/invoice";
 
         let fee_reserve = FeeReserve {
             min_fee_reserve: self.reserve_fee_min,
             percent_fee_reserve: self.fee_percent,
-        };
-
-        let webhook_url = if settings
-            .lnbits
-            .as_ref()
-            .expect("Lnbits must be defined")
-            .retro_api
-        {
-            let mint_url: MintUrl = settings.info.url.parse()?;
-            let webhook_url = mint_url.join(webhook_endpoint)?;
-
-            Some(webhook_url.to_string())
-        } else {
-            None
         };
 
         let lnbits = cdk_lnbits::LNbits::new(
@@ -101,24 +118,11 @@ impl LnBackendSetup for config::LNbits {
             invoice_api_key.clone(),
             self.lnbits_api.clone(),
             fee_reserve,
-            webhook_url,
         )
         .await?;
 
-        if settings
-            .lnbits
-            .as_ref()
-            .expect("Lnbits must be defined")
-            .retro_api
-        {
-            let router = lnbits
-                .create_invoice_webhook_router(webhook_endpoint)
-                .await?;
-
-            routers.push(router);
-        } else {
-            lnbits.subscribe_ws().await?;
-        };
+        // Use v1 websocket API
+        lnbits.subscribe_ws().await?;
 
         Ok(lnbits)
     }
@@ -129,10 +133,25 @@ impl LnBackendSetup for config::LNbits {
 impl LnBackendSetup for config::Lnd {
     async fn setup(
         &self,
-        _routers: &mut Vec<Router>,
         _settings: &Settings,
         _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_lnd::Lnd> {
+        // Validate required connection fields
+        if self.address.is_empty() {
+            bail!("LND address must be set via config or CDK_MINTD_LND_ADDRESS env var");
+        }
+        if self.cert_file.as_os_str().is_empty() {
+            bail!("LND cert_file must be set via config or CDK_MINTD_LND_CERT_FILE env var");
+        }
+        if self.macaroon_file.as_os_str().is_empty() {
+            bail!(
+                "LND macaroon_file must be set via config or CDK_MINTD_LND_MACAROON_FILE env var"
+            );
+        }
+
         let address = &self.address;
         let cert_file = &self.cert_file;
         let macaroon_file = &self.macaroon_file;
@@ -147,6 +166,7 @@ impl LnBackendSetup for config::Lnd {
             cert_file.clone(),
             macaroon_file.clone(),
             fee_reserve,
+            kv_store.expect("Lnd needs kv store"),
         )
         .await?;
 
@@ -159,9 +179,11 @@ impl LnBackendSetup for config::Lnd {
 impl LnBackendSetup for config::FakeWallet {
     async fn setup(
         &self,
-        _router: &mut Vec<Router>,
         _settings: &Settings,
-        _unit: CurrencyUnit,
+        unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        _kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_fake_wallet::FakeWallet> {
         let fee_reserve = FeeReserve {
             min_fee_reserve: self.reserve_fee_min,
@@ -177,6 +199,7 @@ impl LnBackendSetup for config::FakeWallet {
             HashMap::default(),
             HashSet::default(),
             delay_time,
+            unit,
         );
 
         Ok(fake_wallet)
@@ -188,9 +211,11 @@ impl LnBackendSetup for config::FakeWallet {
 impl LnBackendSetup for config::GrpcProcessor {
     async fn setup(
         &self,
-        _routers: &mut Vec<Router>,
         _settings: &Settings,
         _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        _kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_payment_processor::PaymentProcessorClient> {
         let payment_processor = cdk_payment_processor::PaymentProcessorClient::new(
             &self.addr,
@@ -200,5 +225,157 @@ impl LnBackendSetup for config::GrpcProcessor {
         .await?;
 
         Ok(payment_processor)
+    }
+}
+
+#[cfg(feature = "ldk-node")]
+#[async_trait]
+impl LnBackendSetup for config::LdkNode {
+    async fn setup(
+        &self,
+        _settings: &Settings,
+        _unit: CurrencyUnit,
+        runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        work_dir: &Path,
+        _kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<cdk_ldk_node::CdkLdkNode> {
+        use std::net::SocketAddr;
+
+        use bitcoin::Network;
+
+        let fee_reserve = FeeReserve {
+            min_fee_reserve: self.reserve_fee_min,
+            percent_fee_reserve: self.fee_percent,
+        };
+
+        // Parse network from config
+        let network = match self
+            .bitcoin_network
+            .as_ref()
+            .map(|n| n.to_lowercase())
+            .as_deref()
+            .unwrap_or("regtest")
+        {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" => Network::Testnet,
+            "signet" => Network::Signet,
+            _ => Network::Regtest,
+        };
+
+        // Parse chain source from config
+        let chain_source = match self
+            .chain_source_type
+            .as_ref()
+            .map(|s| s.to_lowercase())
+            .as_deref()
+            .unwrap_or("esplora")
+        {
+            "bitcoinrpc" => {
+                let host = self
+                    .bitcoind_rpc_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.bitcoind_rpc_port.unwrap_or(18443);
+                let user = self
+                    .bitcoind_rpc_user
+                    .clone()
+                    .unwrap_or_else(|| "testuser".to_string());
+                let password = self
+                    .bitcoind_rpc_password
+                    .clone()
+                    .unwrap_or_else(|| "testpass".to_string());
+
+                cdk_ldk_node::ChainSource::BitcoinRpc(cdk_ldk_node::BitcoinRpcConfig {
+                    host,
+                    port,
+                    user,
+                    password,
+                })
+            }
+            _ => {
+                let esplora_url = self
+                    .esplora_url
+                    .clone()
+                    .unwrap_or_else(|| "https://mutinynet.com/api".to_string());
+                cdk_ldk_node::ChainSource::Esplora(esplora_url)
+            }
+        };
+
+        // Parse gossip source from config
+        let gossip_source = match self.rgs_url.clone() {
+            Some(rgs_url) => cdk_ldk_node::GossipSource::RapidGossipSync(rgs_url),
+            None => cdk_ldk_node::GossipSource::P2P,
+        };
+
+        // Get storage directory path
+        let storage_dir_path = if let Some(dir_path) = &self.storage_dir_path {
+            dir_path.clone()
+        } else {
+            let mut work_dir = work_dir.to_path_buf();
+            work_dir.push("ldk-node");
+            work_dir.to_string_lossy().to_string()
+        };
+
+        // Get LDK node listen address
+        let host = self
+            .ldk_node_host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = self.ldk_node_port.unwrap_or(8090);
+
+        let socket_addr = SocketAddr::new(host.parse()?, port);
+
+        // Parse socket address using ldk_node's SocketAddress
+        // We need to get the actual socket address struct from ldk_node
+        // For now, let's construct it manually based on the cdk-ldk-node implementation
+        let listen_address = vec![socket_addr.into()];
+
+        let mut ldk_node = cdk_ldk_node::CdkLdkNode::new(
+            network,
+            chain_source,
+            gossip_source,
+            storage_dir_path,
+            fee_reserve,
+            listen_address,
+            runtime,
+        )?;
+
+        // Configure webserver address if specified
+        let webserver_addr = if let Some(host) = &self.webserver_host {
+            let port = self.webserver_port.unwrap_or(8091);
+            let socket_addr: SocketAddr = format!("{host}:{port}").parse()?;
+            Some(socket_addr)
+        } else if self.webserver_port.is_some() {
+            // If only port is specified, use default host
+            let port = self.webserver_port.unwrap_or(8091);
+            let socket_addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+            Some(socket_addr)
+        } else {
+            // Use default webserver address if nothing is configured
+            Some(cdk_ldk_node::CdkLdkNode::default_web_addr())
+        };
+
+        println!("webserver: {:?}", webserver_addr);
+
+        ldk_node.set_web_addr(webserver_addr);
+
+        Ok(ldk_node)
+    }
+}
+
+#[cfg(feature = "portalwallet")]
+#[async_trait]
+impl LnBackendSetup for config::PortalWallet {
+    async fn setup(
+        &self,
+        _settings: &Settings,
+        unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        _work_dir: &Path,
+        _kv_store: Option<Arc<dyn MintKVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<cdk_portal_wallet::SimpleWallet> {
+        let portal_wallet = cdk_portal_wallet::SimpleWallet::new(unit);
+
+        Ok(portal_wallet)
     }
 }

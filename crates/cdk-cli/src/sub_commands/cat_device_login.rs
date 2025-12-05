@@ -1,11 +1,9 @@
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{CurrencyUnit, MintInfo};
-use cdk::wallet::types::WalletKey;
+use cdk::nuts::MintInfo;
 use cdk::wallet::MultiMintWallet;
 use cdk::OidcClient;
 use clap::Args;
@@ -18,14 +16,6 @@ use crate::token_storage;
 pub struct CatDeviceLoginSubCommand {
     /// Mint url
     mint_url: MintUrl,
-    /// Currency unit e.g. sat
-    #[arg(default_value = "sat")]
-    #[arg(short, long)]
-    unit: String,
-    /// Client ID for OIDC authentication
-    #[arg(default_value = "cashu-client")]
-    #[arg(long)]
-    client_id: String,
 }
 
 pub async fn cat_device_login(
@@ -34,27 +24,18 @@ pub async fn cat_device_login(
     work_dir: &Path,
 ) -> Result<()> {
     let mint_url = sub_command_args.mint_url.clone();
-    let unit = CurrencyUnit::from_str(&sub_command_args.unit)?;
 
-    let wallet = match multi_mint_wallet
-        .get_wallet(&WalletKey::new(mint_url.clone(), unit.clone()))
-        .await
-    {
-        Some(wallet) => wallet.clone(),
-        None => {
-            multi_mint_wallet
-                .create_and_add_wallet(&mint_url.to_string(), unit, None)
-                .await?
-        }
-    };
+    // Ensure the mint exists
+    if !multi_mint_wallet.has_mint(&mint_url).await {
+        multi_mint_wallet.add_mint(mint_url.clone()).await?;
+    }
 
-    let mint_info = wallet
-        .get_mint_info()
+    let mint_info = multi_mint_wallet
+        .fetch_mint_info(&mint_url)
         .await?
         .ok_or(anyhow!("Mint info not found"))?;
 
-    let (access_token, refresh_token) =
-        get_device_code_token(&mint_info, &sub_command_args.client_id).await;
+    let (access_token, refresh_token) = get_device_code_token(&mint_info).await;
 
     // Save tokens to file in work directory
     if let Err(e) =
@@ -74,7 +55,7 @@ pub async fn cat_device_login(
     Ok(())
 }
 
-async fn get_device_code_token(mint_info: &MintInfo, client_id: &str) -> (String, String) {
+async fn get_device_code_token(mint_info: &MintInfo) -> (String, String) {
     let openid_discovery = mint_info
         .nuts
         .nut21
@@ -82,7 +63,14 @@ async fn get_device_code_token(mint_info: &MintInfo, client_id: &str) -> (String
         .expect("Nut21 defined")
         .openid_discovery;
 
-    let oidc_client = OidcClient::new(openid_discovery);
+    let client_id = mint_info
+        .nuts
+        .nut21
+        .clone()
+        .expect("Nut21 defined")
+        .client_id;
+
+    let oidc_client = OidcClient::new(openid_discovery, None);
 
     // Get the OIDC configuration
     let oidc_config = oidc_client
@@ -97,7 +85,10 @@ async fn get_device_code_token(mint_info: &MintInfo, client_id: &str) -> (String
     let client = reqwest::Client::new();
     let device_code_response = client
         .post(device_auth_url)
-        .form(&[("client_id", client_id)])
+        .form(&[
+            ("client_id", client_id.clone().as_str()),
+            ("scope", "openid offline_access"),
+        ])
         .send()
         .await
         .expect("Failed to send device code request");
@@ -143,7 +134,7 @@ async fn get_device_code_token(mint_info: &MintInfo, client_id: &str) -> (String
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code),
-                ("client_id", client_id),
+                ("client_id", client_id.clone().as_str()),
             ])
             .send()
             .await

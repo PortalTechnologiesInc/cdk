@@ -1,3 +1,4 @@
+
 [info]
 url = "https://mint.thesimplekid.dev/"
 listen_host = "127.0.0.1"
@@ -6,12 +7,30 @@ mnemonic = ""
 # input_fee_ppk = 0
 # enable_swagger_ui = false
 
+[info.quote_ttl]
+# Prefer explicit fields over inline tables for readability and ease of overrides
+mint_ttl = 600
+melt_ttl = 120
+
+
+[info.logging]
+# Where to output logs: "stderr" (standard error stream), "file", or "both" (default: "both")
+# output = "both"
+# Log level for console output (default: "info")
+# console_level = "info"  
+# Log level for file output (default: "debug")
+# file_level = "debug"
+
 [mint_management_rpc]
 enabled = false
 # address = "127.0.0.1"
 # port = 8086
 
-
+#[prometheus]
+#enabled = true
+#address = "127.0.0.1"
+#port = 9090
+# 
 [info.http_cache]
 # memory or redis
 backend = "memory"
@@ -38,42 +57,111 @@ tti = 60
 
 
 [database]
-# Database engine (sqlite/redb) defaults to sqlite
-# engine = "sqlite"
+# Database engine (sqlite/postgres) defaults to sqlite
+engine = "sqlite"
+
+# PostgreSQL configuration (when engine = "postgres")
+[database.postgres]
+# PostgreSQL connection URL
+# Can also be set via CDK_MINTD_POSTGRES_URL or CDK_MINTD_DATABASE_URL environment variables
+# Environment variables take precedence over config file settings
+url = "postgresql://user:password@localhost:5432/cdk_mint"
+# TLS mode: "disable", "prefer", "require" (optional, defaults to "disable")
+tls_mode = "disable"
+# Maximum number of connections in the pool (optional, defaults to 20)
+max_connections = 20
+# Connection timeout in seconds (optional, defaults to 10)
+connection_timeout_seconds = 10
+
+# Auth database configuration (optional, only used when auth is enabled)
+[auth_database.postgres]
+# PostgreSQL connection URL for authentication database
+# Can also be set via CDK_MINTD_AUTH_POSTGRES_URL environment variable
+# Environment variables take precedence over config file settings
+url = "postgresql://user:password@localhost:5432/cdk_mint_auth"
+# TLS mode: "disable", "prefer", "require" (optional, defaults to "disable")
+tls_mode = "disable"
+# Maximum number of connections in the pool (optional, defaults to 20)
+max_connections = 20
+# Connection timeout in seconds (optional, defaults to 10)
+connection_timeout_seconds = 10
 
 [ln]
-# Required ln backend `cln`, `lnd`, `fakewallet`, 'lnbits'
+# Required ln backend `cln`, `lnd`, `fakewallet`, 'lnbits', 'ldknode'
 ln_backend = "fakewallet"
 # min_mint=1
 # max_mint=500000
 # min_melt=1
 # max_melt=500000
 
-[cln]
-rpc_path = ""
-fee_percent = 0.04
-reserve_fee_min = 4
+# [cln]
+# rpc_path = "/path/to/.lightning/bitcoin/lightning-rpc"
+# bolt12 = true              # Optional, defaults to true
+# fee_percent = 0.02         # Optional, defaults to 2%
+# reserve_fee_min = 2        # Optional, defaults to 2 sats
 
 # [lnbits]
 # admin_api_key = ""
 # invoice_api_key = ""
 # lnbits_api = ""
-# To be set true to support pre v1 lnbits api
-# retro_api=false
+# fee_percent = 0.02         # Optional, defaults to 2%
+# reserve_fee_min = 2        # Optional, defaults to 2 sats
+# Note: Only LNBits v1 API is supported (websocket-based)
 
 # [lnd]
-# address = "https://domain:port"
-# macaroon_file = ""
-# cert_file = ""
-# fee_percent=0.04
-# reserve_fee_min=4
+# address = "https://localhost:10009"
+# cert_file = "/path/to/.lnd/tls.cert"
+# macaroon_file = "/path/to/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+# fee_percent = 0.02         # Optional, defaults to 2%
+# reserve_fee_min = 2        # Optional, defaults to 2 sats
 
-# [fake_wallet]
-# supported_units = ["sat"]
-# fee_percent = 0.02
-# reserve_fee_min = 1
-# min_delay_time = 1
-# max_delay_time = 3
+# [ldk_node]
+# fee_percent = 0.02         # Optional, defaults to 2%
+# reserve_fee_min = 2        # Optional, defaults to 2 sats
+# bitcoin_network = "signet"  # mainnet, testnet, signet, regtest
+# chain_source_type = "esplora"  # esplora, bitcoinrpc  
+# 
+# # Mutinynet configuration (recommended for testing)
+# esplora_url = "https://mutinynet.com/api"
+# gossip_source_type = "rgs"  # Use RGS for better performance
+# rgs_url = "https://rgs.mutinynet.com/snapshot/0"
+# storage_dir_path = "~/.cdk-ldk-node/mutinynet"
+# 
+# # Testnet configuration
+# # bitcoin_network = "testnet"
+# # esplora_url = "https://blockstream.info/testnet/api"
+# # rgs_url = "https://rapidsync.lightningdevkit.org/snapshot"
+# # storage_dir_path = "~/.cdk-ldk-node/testnet"
+# 
+# # Mainnet configuration (CAUTION: Real Bitcoin!)
+# # bitcoin_network = "mainnet"
+# # esplora_url = "https://blockstream.info/api"  
+# # rgs_url = "https://rapidsync.lightningdevkit.org/snapshot"
+# # storage_dir_path = "~/.cdk-ldk-node/mainnet"
+# 
+# # Bitcoin RPC configuration (when chain_source_type = "bitcoinrpc")
+# bitcoind_rpc_host = "127.0.0.1"
+# bitcoind_rpc_port = 18443
+# bitcoind_rpc_user = "testuser" 
+# bitcoind_rpc_password = "testpass"
+# 
+# # Node configuration
+# ldk_node_host = "127.0.0.1"
+# ldk_node_port = 8090
+# 
+# # Gossip source configuration  
+# gossip_source_type = "p2p"  # p2p (direct peer-to-peer) or rgs (rapid gossip sync)
+# 
+# # Webserver configuration for LDK node management interface
+# webserver_host = "127.0.0.1"  # Default: 127.0.0.1
+# webserver_port = 0  # 0 = auto-assign available port
+
+[fake_wallet]
+supported_units = ["sat"]
+fee_percent = 0.02
+reserve_fee_min = 1
+min_delay_time = 1
+max_delay_time = 3
 
 # [grpc_processor]
 # gRPC Payment Processor configuration
@@ -83,12 +171,23 @@ reserve_fee_min = 4
 # tls_dir = "/path/to/tls"
 
 # [auth]
+# Set to true to enable authentication features (defaults to false)
+# auth_enabled = false
 # openid_discovery = "http://127.0.0.1:8080/realms/cdk-test-realm/.well-known/openid-configuration"
 # openid_client_id = "cashu-client"
 # mint_max_bat=50
-# enabled_mint=true
-# enabled_melt=true
-# enabled_swap=true
-# enabled_check_mint_quote=true
-# enabled_check_melt_quote=true
-# enabled_restore=true
+
+# Authentication settings for endpoints
+# Options: "clear", "blind", "none" (none = disabled)
+
+# mint = "blind"
+# get_mint_quote = "none"  
+# check_mint_quote = "none"
+
+# melt = "none"
+# get_melt_quote = "none"
+# check_melt_quote = "none"
+
+# swap = "blind"
+# restore = "blind"
+# check_proof_state = "none"

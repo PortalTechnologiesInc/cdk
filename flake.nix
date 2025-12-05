@@ -21,147 +21,109 @@
 
     crane = {
       url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
 
     pre-commit-hooks.url = "github:cachix/pre-commit-hooks.nix";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, pre-commit-hooks, crane, fenix, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    { self
+    , nixpkgs
+    , rust-overlay
+    , flake-utils
+    , pre-commit-hooks
+    , ...
+    }@inputs:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         overlays = [ (import rust-overlay) ];
         lib = pkgs.lib;
         stdenv = pkgs.stdenv;
         isDarwin = stdenv.isDarwin;
-        libsDarwin = with pkgs; lib.optionals isDarwin [
-          # Additional darwin specific inputs can be set here
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-        ];
+        libsDarwin =
+          with pkgs;
+          lib.optionals isDarwin [
+            # Additional darwin specific inputs can be set here
+            darwin.apple_sdk.frameworks.Security
+            darwin.apple_sdk.frameworks.SystemConfiguration
+          ];
 
         # Dependencies
         pkgs = import nixpkgs {
           inherit system overlays;
         };
 
-
-
         # Toolchains
         # latest stable
-        stable_toolchain = pkgs.rust-bin.stable."1.86.0".default.override {
+        stable_toolchain = pkgs.rust-bin.stable."1.91.1".default.override {
           targets = [ "wasm32-unknown-unknown" ]; # wasm
-          extensions = [ "rustfmt" "clippy" "rust-analyzer" ];
+          extensions = [
+            "rustfmt"
+            "clippy"
+            "rust-analyzer"
+          ];
         };
 
         # MSRV stable
-        msrv_toolchain = pkgs.rust-bin.stable."1.75.0".default.override {
+        msrv_toolchain = pkgs.rust-bin.stable."1.85.0".default.override {
           targets = [ "wasm32-unknown-unknown" ]; # wasm
+          extensions = [
+            "rustfmt"
+            "clippy"
+            "rust-analyzer"
+          ];
         };
 
         # Nightly used for formatting
-        nightly_toolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-          extensions = [ "rustfmt" "clippy" "rust-analyzer" "rust-src" ];
-          targets = [ "wasm32-unknown-unknown" ]; # wasm
-        });
+        nightly_toolchain = pkgs.rust-bin.selectLatestNightlyWith (
+          toolchain:
+          toolchain.default.override {
+            extensions = [
+              "rustfmt"
+              "clippy"
+              "rust-analyzer"
+              "rust-src"
+            ];
+            targets = [ "wasm32-unknown-unknown" ]; # wasm
+          }
+        );
 
         # Common inputs
-        envVars = { };
-        buildInputs = with pkgs; [
-          # Add additional build inputs here
-          git
-          pkg-config
-          curl
-          just
-          protobuf
-          nixpkgs-fmt
-          typos
-          lnd
-          clightning
-          bitcoind
-          sqlx-cli
-          cargo-outdated
+        envVars = {
+          # rust analyzer needs  NIX_PATH for some reason.
+          NIX_PATH = "nixpkgs=${inputs.nixpkgs}";
+        };
+        buildInputs =
+          with pkgs;
+          [
+            # Add additional build inputs here
+            git
+            pkg-config
+            curl
+            just
+            protobuf
+            nixpkgs-fmt
+            typos
+            lnd
+            clightning
+            bitcoind
+            sqlx-cli
+            mprocs
 
-          # Needed for github ci
-          libz
-        ] ++ libsDarwin;
+            cargo-outdated
+            cargo-mutants
 
-        # WASM deps
-        WASMInputs = with pkgs; [
-        ];
-
-
-
-        craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
+            # Needed for github ci
+            libz
+          ]
+          ++ libsDarwin;
 
         # Common arguments can be set here to avoid repeating them later
-        commonArgs = {
-          inherit src;
-          strictDeps = true;
-
-          buildInputs = [
-            # Add additional build inputs here
-            pkgs.protobuf
-            pkgs.pkg-config
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [
-            # Additional darwin specific inputs can be set here
-            pkgs.libiconv
-          ];
-
-          # Additional environment variables can be set directly
-          # MY_CUSTOM_VAR = "some value";
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
-          PROTOC_INCLUDE = "${pkgs.protobuf}/include";
-        };
-
-
-        craneLibLLvmTools = craneLib.overrideToolchain
-          (fenix.packages.${system}.complete.withComponents [
-            "cargo"
-            "llvm-tools"
-            "rustc"
-          ]);
-
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-        individualCrateArgs = commonArgs // {
-          inherit cargoArtifacts;
-          inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
-          # NB: we disable tests since we'll run them all via cargo-nextest
-          doCheck = false;
-        };
-
-        fileSetForCrate = crate: lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            ./Cargo.toml
-            ./Cargo.lock
-            (craneLib.fileset.commonCargoSources ./crates/cdk)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-axum)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-cln)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-lnd)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-fake-wallet)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-lnbits)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-redb)
-            (craneLib.fileset.commonCargoSources ./crates/cdk-sqlite)
-            ./crates/cdk-sqlite/src/mint/migrations
-            ./crates/cdk-sqlite/src/wallet/migrations
-            (craneLib.fileset.commonCargoSources crate)
-          ];
-        };
-
-        cdk-mintd = craneLib.buildPackage (individualCrateArgs // {
-          pname = "cdk-mintd";
-          name = "cdk-mintd-${individualCrateArgs.version}";
-          cargoExtraArgs = "-p cdk-mintd";
-          src = fileSetForCrate ./crates/cdk-mintd;
-        });
-
-
-        nativeBuildInputs = with pkgs; [
+        nativeBuildInputs = [
           #Add additional build inputs here
-        ] ++ lib.optionals isDarwin [
+        ]
+        ++ lib.optionals isDarwin [
           # Additional darwin specific native inputs can be set here
         ];
       in
@@ -178,7 +140,10 @@
                 inherit (_rust) meta;
                 buildInputs = [ pkgs.makeWrapper ];
                 paths = [ _rust ];
-                pathsToLink = [ "/" "/bin" ];
+                pathsToLink = [
+                  "/"
+                  "/bin"
+                ];
                 postBuild = ''
                   for i in $out/bin/*; do
                     wrapProgram "$i" --prefix PATH : "$out/bin"
@@ -200,90 +165,92 @@
             };
         };
 
-
-        packages = {
-          inherit cdk-mintd;
-          default = cdk-mintd;
-        } // lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
-          my-workspace-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
-            inherit cargoArtifacts;
-          });
-        };
-
-        apps = {
-          cdk-mintd = flake-utils.lib.mkApp {
-            drv = cdk-mintd;
-          };
-        };
-
         devShells =
           let
             # pre-commit-checks
             _shellHook = (self.checks.${system}.pre-commit-check.shellHook or "");
 
             # devShells
-            msrv = pkgs.mkShell ({
-              shellHook = "
+            msrv = pkgs.mkShell (
+              {
+                shellHook = "
+                  cargo update
+                  cargo update home --precise 0.5.11
               ${_shellHook}
-              cargo update
-              # cargo update -p async-compression --precise 0.4.3
-              cargo update -p home --precise 0.5.9
-              cargo update -p zerofrom --precise 0.1.5
-              cargo update -p half --precise 2.4.1
-              cargo update -p base64ct --precise 1.7.3
-              cargo update -p url --precise 2.5.2
-              cargo update -p pest_derive --precise 2.8.0
-              cargo update -p pest_generator --precise 2.8.0
-              cargo update -p pest_meta --precise 2.8.0
-              cargo update -p pest --precise 2.8.0
               ";
-              buildInputs = buildInputs ++ WASMInputs ++ [ msrv_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+                buildInputs = buildInputs ++ [ msrv_toolchain ];
+                inherit nativeBuildInputs;
+              }
+              // envVars
+            );
 
-            stable = pkgs.mkShell ({
-              shellHook = ''${_shellHook}'';
-              buildInputs = buildInputs ++ WASMInputs ++ [ stable_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+            stable = pkgs.mkShell (
+              {
+                shellHook = ''
+                  ${_shellHook}
+                  # Needed for github ci
+                  export LD_LIBRARY_PATH=${
+                    pkgs.lib.makeLibraryPath [
+                      pkgs.zlib
+                    ]
+                  }:$LD_LIBRARY_PATH
+                '';
+                buildInputs = buildInputs ++ [ stable_toolchain ];
+                inherit nativeBuildInputs;
 
+              }
+              // envVars
+            );
 
-            nightly = pkgs.mkShell ({
-              shellHook = ''
-                ${_shellHook}
-                # Needed for github ci
-                export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
-                  pkgs.zlib
-                  ]}:$LD_LIBRARY_PATH
-                export RUST_SRC_PATH=${nightly_toolchain}/lib/rustlib/src/rust/library
-              '';
-              buildInputs = buildInputs ++ [ nightly_toolchain ];
-              inherit nativeBuildInputs;
-            } // envVars);
+            nightly = pkgs.mkShell (
+              {
+                shellHook = ''
+                  ${_shellHook}
+                  # Needed for github ci
+                  export LD_LIBRARY_PATH=${
+                    pkgs.lib.makeLibraryPath [
+                      pkgs.zlib
+                    ]
+                  }:$LD_LIBRARY_PATH
+                '';
+                buildInputs = buildInputs ++ [ nightly_toolchain ];
+                inherit nativeBuildInputs;
+              }
+              // envVars
+            );
 
             # Shell with Docker for integration tests
-            integration = pkgs.mkShell ({
-              shellHook = ''
-                ${_shellHook}
-                # Ensure Docker is available
-                if ! command -v docker &> /dev/null; then
-                  echo "Docker is not installed or not in PATH"
-                  echo "Please install Docker to run integration tests"
-                  exit 1
-                fi
-                echo "Docker is available at $(which docker)"
-                echo "Docker version: $(docker --version)"
-              '';
-              buildInputs = buildInputs ++ [ 
-                stable_toolchain
-                pkgs.docker-client
-              ];
-              inherit nativeBuildInputs;
-            } // envVars);
+            integration = pkgs.mkShell (
+              {
+                shellHook = ''
+                  ${_shellHook}
+                  # Ensure Docker is available
+                  if ! command -v docker &> /dev/null; then
+                    echo "Docker is not installed or not in PATH"
+                    echo "Please install Docker to run integration tests"
+                    exit 1
+                  fi
+                  echo "Docker is available at $(which docker)"
+                  echo "Docker version: $(docker --version)"
+                '';
+                buildInputs = buildInputs ++ [
+                  stable_toolchain
+                  pkgs.docker-client
+                  pkgs.python311
+                ];
+                inherit nativeBuildInputs;
+              }
+              // envVars
+            );
 
           in
           {
-            inherit msrv stable nightly integration;
+            inherit
+              msrv
+              stable
+              nightly
+              integration
+              ;
             default = stable;
           };
       }

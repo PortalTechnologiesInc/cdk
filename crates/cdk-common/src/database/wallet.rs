@@ -69,6 +69,8 @@ pub trait Database: Debug {
     async fn add_melt_quote(&self, quote: wallet::MeltQuote) -> Result<(), Self::Err>;
     /// Get melt quote from storage
     async fn get_melt_quote(&self, quote_id: &str) -> Result<Option<wallet::MeltQuote>, Self::Err>;
+    /// Get melt quotes from storage
+    async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, Self::Err>;
     /// Remove melt quote from storage
     async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), Self::Err>;
 
@@ -94,13 +96,20 @@ pub trait Database: Debug {
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, Self::Err>;
+    /// Get proofs by Y values
+    async fn get_proofs_by_ys(&self, ys: Vec<PublicKey>) -> Result<Vec<ProofInfo>, Self::Err>;
+    /// Get balance
+    async fn get_balance(
+        &self,
+        mint_url: Option<MintUrl>,
+        unit: Option<CurrencyUnit>,
+        state: Option<Vec<State>>,
+    ) -> Result<u64, Self::Err>;
     /// Update proofs state in storage
     async fn update_proofs_state(&self, ys: Vec<PublicKey>, state: State) -> Result<(), Self::Err>;
 
-    /// Increment Keyset counter
-    async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<(), Self::Err>;
-    /// Get current Keyset counter
-    async fn get_keyset_counter(&self, keyset_id: &Id) -> Result<Option<u32>, Self::Err>;
+    /// Atomically increment Keyset counter and return new value
+    async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Self::Err>;
 
     /// Add transaction to storage
     async fn add_transaction(&self, transaction: Transaction) -> Result<(), Self::Err>;

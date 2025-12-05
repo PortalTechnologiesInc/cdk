@@ -75,14 +75,14 @@ impl Mint {
     pub async fn rotate_keyset(
         &self,
         unit: CurrencyUnit,
-        max_order: u8,
+        amounts: Vec<u64>,
         input_fee_ppk: u64,
     ) -> Result<MintKeySetInfo, Error> {
         let result = self
             .signatory
             .rotate_keyset(RotateKeyArguments {
                 unit,
-                max_order,
+                amounts,
                 input_fee_ppk,
             })
             .await?;

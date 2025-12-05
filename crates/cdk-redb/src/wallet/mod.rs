@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use super::error::Error;
 use crate::migrations::migrate_00_to_01;
-use crate::wallet::migrations::migrate_01_to_02;
+use crate::wallet::migrations::{migrate_01_to_02, migrate_02_to_03, migrate_03_to_04};
 
 mod migrations;
 
@@ -44,7 +44,9 @@ const KEYSET_COUNTER: TableDefinition<&str, u32> = TableDefinition::new("keyset_
 // <Transaction_id, Transaction>
 const TRANSACTIONS_TABLE: TableDefinition<&[u8], &str> = TableDefinition::new("transactions");
 
-const DATABASE_VERSION: u32 = 2;
+const KEYSET_U32_MAPPING: TableDefinition<u32, &str> = TableDefinition::new("keyset_u32_mapping");
+
+const DATABASE_VERSION: u32 = 4;
 
 /// Wallet Redb Database
 #[derive(Debug, Clone)]
@@ -56,6 +58,16 @@ impl WalletRedbDatabase {
     /// Create new [`WalletRedbDatabase`]
     pub fn new(path: &Path) -> Result<Self, Error> {
         {
+            // Check if parent directory exists before attempting to create database
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Parent directory does not exist: {parent:?}"),
+                    )));
+                }
+            }
+
             let db = Arc::new(Database::create(path)?);
 
             let db_version: Option<String>;
@@ -88,6 +100,14 @@ impl WalletRedbDatabase {
 
                             if current_file_version == 1 {
                                 current_file_version = migrate_01_to_02(Arc::clone(&db))?;
+                            }
+
+                            if current_file_version == 2 {
+                                current_file_version = migrate_02_to_03(Arc::clone(&db))?;
+                            }
+
+                            if current_file_version == 3 {
+                                current_file_version = migrate_03_to_04(Arc::clone(&db))?;
                             }
 
                             if current_file_version != DATABASE_VERSION {
@@ -136,6 +156,7 @@ impl WalletRedbDatabase {
                         let _ = write_txn.open_table(PROOFS_TABLE)?;
                         let _ = write_txn.open_table(KEYSET_COUNTER)?;
                         let _ = write_txn.open_table(TRANSACTIONS_TABLE)?;
+                        let _ = write_txn.open_table(KEYSET_U32_MAPPING)?;
                         table.insert("db_version", DATABASE_VERSION.to_string().as_str())?;
                     }
 
@@ -145,7 +166,19 @@ impl WalletRedbDatabase {
             drop(db);
         }
 
-        let db = Database::create(path)?;
+        // Check parent directory again for final database creation
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Parent directory does not exist: {parent:?}"),
+                )));
+            }
+        }
+
+        let mut db = Database::create(path)?;
+
+        db.upgrade()?;
 
         Ok(Self { db: Arc::new(db) })
     }
@@ -290,19 +323,63 @@ impl WalletDatabase for WalletRedbDatabase {
     ) -> Result<(), Self::Err> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
 
+        let mut existing_u32 = false;
+
         {
             let mut table = write_txn
                 .open_multimap_table(MINT_KEYSETS_TABLE)
                 .map_err(Error::from)?;
             let mut keysets_table = write_txn.open_table(KEYSETS_TABLE).map_err(Error::from)?;
+            let mut u32_table = write_txn
+                .open_table(KEYSET_U32_MAPPING)
+                .map_err(Error::from)?;
 
             for keyset in keysets {
-                table
-                    .insert(
-                        mint_url.to_string().as_str(),
-                        keyset.id.to_bytes().as_slice(),
-                    )
+                // Check if keyset already exists
+                let existing_keyset = {
+                    let existing_keyset = keysets_table
+                        .get(keyset.id.to_bytes().as_slice())
+                        .map_err(Error::from)?;
+
+                    existing_keyset.map(|r| r.value().to_string())
+                };
+
+                let existing = u32_table
+                    .insert(u32::from(keyset.id), keyset.id.to_string().as_str())
                     .map_err(Error::from)?;
+
+                match existing {
+                    None => existing_u32 = false,
+                    Some(id) => {
+                        let id = Id::from_str(id.value())?;
+
+                        if id == keyset.id {
+                            existing_u32 = false;
+                        } else {
+                            println!("Breaking here");
+                            existing_u32 = true;
+                            break;
+                        }
+                    }
+                }
+
+                let keyset = if let Some(existing_keyset) = existing_keyset {
+                    let mut existing_keyset: KeySetInfo = serde_json::from_str(&existing_keyset)?;
+
+                    existing_keyset.active = keyset.active;
+                    existing_keyset.input_fee_ppk = keyset.input_fee_ppk;
+
+                    existing_keyset
+                } else {
+                    table
+                        .insert(
+                            mint_url.to_string().as_str(),
+                            keyset.id.to_bytes().as_slice(),
+                        )
+                        .map_err(Error::from)?;
+
+                    keyset
+                };
 
                 keysets_table
                     .insert(
@@ -314,6 +391,14 @@ impl WalletDatabase for WalletRedbDatabase {
                     .map_err(Error::from)?;
             }
         }
+
+        if existing_u32 {
+            tracing::warn!("Keyset already exists for keyset id");
+            write_txn.abort().map_err(Error::from)?;
+
+            return Err(database::Error::Duplicate);
+        }
+
         write_txn.commit().map_err(Error::from)?;
 
         Ok(())
@@ -478,6 +563,21 @@ impl WalletDatabase for WalletRedbDatabase {
     }
 
     #[instrument(skip_all)]
+    async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, Self::Err> {
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let table = read_txn
+            .open_table(MELT_QUOTES_TABLE)
+            .map_err(Error::from)?;
+
+        Ok(table
+            .iter()
+            .map_err(Error::from)?
+            .flatten()
+            .flat_map(|(_id, quote)| serde_json::from_str(quote.value()))
+            .collect())
+    }
+
+    #[instrument(skip_all)]
     async fn remove_melt_quote(&self, quote_id: &str) -> Result<(), Self::Err> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
 
@@ -499,16 +599,45 @@ impl WalletDatabase for WalletRedbDatabase {
 
         keyset.verify_id()?;
 
+        let existing_keys;
+        let existing_u32;
+
         {
             let mut table = write_txn.open_table(MINT_KEYS_TABLE).map_err(Error::from)?;
-            table
+
+            existing_keys = table
                 .insert(
                     keyset.id.to_string().as_str(),
                     serde_json::to_string(&keyset.keys)
                         .map_err(Error::from)?
                         .as_str(),
                 )
+                .map_err(Error::from)?
+                .is_some();
+
+            let mut table = write_txn
+                .open_table(KEYSET_U32_MAPPING)
                 .map_err(Error::from)?;
+
+            let existing = table
+                .insert(u32::from(keyset.id), keyset.id.to_string().as_str())
+                .map_err(Error::from)?;
+
+            match existing {
+                None => existing_u32 = false,
+                Some(id) => {
+                    let id = Id::from_str(id.value())?;
+
+                    existing_u32 = id != keyset.id;
+                }
+            }
+        }
+
+        if existing_keys || existing_u32 {
+            tracing::warn!("Keys already exist for keyset id");
+            write_txn.abort().map_err(Error::from)?;
+
+            return Err(database::Error::Duplicate);
         }
 
         write_txn.commit().map_err(Error::from)?;
@@ -612,6 +741,40 @@ impl WalletDatabase for WalletRedbDatabase {
         Ok(proofs)
     }
 
+    #[instrument(skip(self, ys))]
+    async fn get_proofs_by_ys(&self, ys: Vec<PublicKey>) -> Result<Vec<ProofInfo>, Self::Err> {
+        if ys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let table = read_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
+
+        let mut proofs = Vec::new();
+
+        for y in ys {
+            if let Some(proof) = table.get(y.to_bytes().as_slice()).map_err(Error::from)? {
+                let proof_info =
+                    serde_json::from_str::<ProofInfo>(proof.value()).map_err(Error::from)?;
+                proofs.push(proof_info);
+            }
+        }
+
+        Ok(proofs)
+    }
+
+    async fn get_balance(
+        &self,
+        mint_url: Option<MintUrl>,
+        unit: Option<CurrencyUnit>,
+        state: Option<Vec<State>>,
+    ) -> Result<u64, database::Error> {
+        // For redb, we still need to fetch all proofs and sum them
+        // since redb doesn't have SQL aggregation
+        let proofs = self.get_proofs(mint_url, unit, state, None).await?;
+        Ok(proofs.iter().map(|p| u64::from(p.proof.amount)).sum())
+    }
+
     async fn update_proofs_state(
         &self,
         ys: Vec<PublicKey>,
@@ -653,10 +816,11 @@ impl WalletDatabase for WalletRedbDatabase {
     }
 
     #[instrument(skip(self), fields(keyset_id = %keyset_id))]
-    async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<(), Self::Err> {
+    async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Self::Err> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
 
         let current_counter;
+        let new_counter;
         {
             let table = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
             let counter = table
@@ -667,11 +831,12 @@ impl WalletDatabase for WalletRedbDatabase {
                 Some(c) => c.value(),
                 None => 0,
             };
+
+            new_counter = current_counter + count;
         }
 
         {
             let mut table = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
-            let new_counter = current_counter + count;
 
             table
                 .insert(keyset_id.to_string().as_str(), new_counter)
@@ -679,23 +844,13 @@ impl WalletDatabase for WalletRedbDatabase {
         }
         write_txn.commit().map_err(Error::from)?;
 
-        Ok(())
-    }
-
-    #[instrument(skip(self), fields(keyset_id = %keyset_id))]
-    async fn get_keyset_counter(&self, keyset_id: &Id) -> Result<Option<u32>, Self::Err> {
-        let read_txn = self.db.begin_read().map_err(Error::from)?;
-        let table = read_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
-
-        let counter = table
-            .get(keyset_id.to_string().as_str())
-            .map_err(Error::from)?;
-
-        Ok(counter.map(|c| c.value()))
+        Ok(new_counter)
     }
 
     #[instrument(skip(self))]
     async fn add_transaction(&self, transaction: Transaction) -> Result<(), Self::Err> {
+        let id = transaction.id();
+
         let write_txn = self.db.begin_write().map_err(Error::from)?;
 
         {
@@ -704,7 +859,7 @@ impl WalletDatabase for WalletRedbDatabase {
                 .map_err(Error::from)?;
             table
                 .insert(
-                    transaction.id().as_slice(),
+                    id.as_slice(),
                     serde_json::to_string(&transaction)
                         .map_err(Error::from)?
                         .as_str(),

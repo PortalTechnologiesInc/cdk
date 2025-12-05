@@ -6,19 +6,24 @@ use cashu::{Bolt11Invoice, ProofsMethods};
 use cdk::amount::{Amount, SplitTarget};
 use cdk::nuts::CurrencyUnit;
 use cdk::wallet::{ReceiveOptions, SendKind, SendOptions, Wallet};
-use cdk_integration_tests::{
-    create_invoice_for_env, get_mint_url_from_env, pay_if_regtest, wait_for_mint_to_be_paid,
-};
+use cdk_integration_tests::init_regtest::get_temp_dir;
+use cdk_integration_tests::{create_invoice_for_env, get_mint_url_from_env, pay_if_regtest};
 use cdk_sqlite::wallet::memory;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_swap() {
+    // Set up logging
+    let default_filter = "debug";
+    let sqlx_filter = "sqlx=warn,hyper_util=warn,reqwest=warn,rustls=warn";
+    let env_filter = EnvFilter::new(format!("{},{}", default_filter, sqlx_filter));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
     let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
     let wallet = Wallet::new(
         &get_mint_url_from_env(),
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &seed,
+        seed,
         None,
     )
     .expect("failed to create new wallet");
@@ -26,22 +31,21 @@ async fn test_swap() {
     let mint_quote = wallet.mint_quote(100.into(), None).await.unwrap();
 
     let invoice = Bolt11Invoice::from_str(&mint_quote.request).unwrap();
-    pay_if_regtest(&invoice).await.unwrap();
+    pay_if_regtest(&get_temp_dir(), &invoice).await.unwrap();
 
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
+    let proofs = wallet
+        .wait_and_mint_quote(
+            mint_quote.clone(),
+            SplitTarget::default(),
+            None,
+            tokio::time::Duration::from_secs(60),
+        )
         .await
-        .unwrap();
-
-    let proofs: Vec<Amount> = wallet
-        .get_unspent_proofs()
-        .await
-        .unwrap()
-        .iter()
-        .map(|p| p.amount)
-        .collect();
+        .expect("payment");
 
     println!("{:?}", proofs);
+
+    println!("{:?}", wallet.get_mint_keysets().await.unwrap());
 
     let send = wallet
         .prepare_send(
@@ -60,7 +64,7 @@ async fn test_swap() {
 
     assert_eq!(fee, 1.into());
 
-    let send = wallet.send(send, None).await.unwrap();
+    let send = send.confirm(None).await.unwrap();
 
     let rec_amount = wallet
         .receive(&send.to_string(), ReceiveOptions::default())
@@ -80,7 +84,7 @@ async fn test_fake_melt_change_in_quote() {
         &get_mint_url_from_env(),
         CurrencyUnit::Sat,
         Arc::new(memory::empty().await.unwrap()),
-        &Mnemonic::generate(12).unwrap().to_seed_normalized(""),
+        Mnemonic::generate(12).unwrap().to_seed_normalized(""),
         None,
     )
     .expect("failed to create new wallet");
@@ -89,16 +93,17 @@ async fn test_fake_melt_change_in_quote() {
 
     let bolt11 = Bolt11Invoice::from_str(&mint_quote.request).unwrap();
 
-    pay_if_regtest(&bolt11).await.unwrap();
+    pay_if_regtest(&get_temp_dir(), &bolt11).await.unwrap();
 
-    wait_for_mint_to_be_paid(&wallet, &mint_quote.id, 60)
+    let _proofs = wallet
+        .wait_and_mint_quote(
+            mint_quote.clone(),
+            SplitTarget::default(),
+            None,
+            tokio::time::Duration::from_secs(60),
+        )
         .await
-        .unwrap();
-
-    let _mint_amount = wallet
-        .mint(&mint_quote.id, SplitTarget::default(), None)
-        .await
-        .unwrap();
+        .expect("payment");
 
     let invoice_amount = 9;
 

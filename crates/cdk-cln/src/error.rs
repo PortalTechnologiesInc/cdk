@@ -26,6 +26,15 @@ pub enum Error {
     /// Amount Error
     #[error(transparent)]
     Amount(#[from] cdk_common::amount::Error),
+    /// UTF-8 Error
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    /// Bolt12 Error
+    #[error("Bolt12 error: {0}")]
+    Bolt12(String),
+    /// Database Error
+    #[error("Database error: {0}")]
+    Database(String),
 }
 
 impl From<Error> for cdk_common::payment::Error {

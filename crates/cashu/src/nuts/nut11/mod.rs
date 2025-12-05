@@ -9,18 +9,20 @@ use std::{fmt, vec};
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::schnorr::Signature;
-use serde::de::Error as DeserializerError;
+use serde::de::{DeserializeOwned, Error as DeserializerError};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use super::nut00::Witness;
 use super::nut01::PublicKey;
+use super::nut05::MeltRequest;
+use super::nut10::SpendingConditionVerification;
 use super::{Kind, Nut10Secret, Proof, Proofs, SecretKey};
-use crate::ensure_cdk;
 use crate::nuts::nut00::BlindedMessage;
 use crate::secret::Secret;
 use crate::util::{hex, unix_time};
+use crate::{ensure_cdk, SwapRequest};
 
 pub mod serde_p2pk_witness;
 
@@ -57,12 +59,21 @@ pub enum Error {
     /// HTLC hash invalid
     #[error("Invalid hash")]
     InvalidHash,
+    /// HTLC preimage too large
+    #[error("Preimage exceeds maximum size of 32 bytes (64 hex characters)")]
+    PreimageTooLarge,
     /// Witness Signatures not provided
     #[error("Witness signatures not provided")]
     SignaturesNotProvided,
     /// Duplicate signature from same pubkey
     #[error("Duplicate signature from the same pubkey detected")]
     DuplicateSignature,
+    /// Preimage not supported in P2PK
+    #[error("P2PK does not support preimage requirements")]
+    PreimageNotSupportedInP2PK,
+    /// SIG_ALL not supported in this context
+    #[error("SIG_ALL proofs must be verified using a different method")]
+    SigAllNotSupportedHere,
     /// Parse Url Error
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
@@ -133,76 +144,52 @@ impl Proof {
             .cloned()
             .unwrap_or_default()
             .try_into()?;
-        let msg: &[u8] = self.secret.as_bytes();
 
-        let mut verified_pubkeys = HashSet::new();
+        if spending_conditions.sig_flag == SigFlag::SigAll {
+            return Err(Error::SigAllNotSupportedHere);
+        }
 
+        if secret.kind() != Kind::P2PK {
+            return Err(Error::IncorrectSecretKind);
+        }
+
+        // Based on the current time, we must identify the relevant keys
+        let now = unix_time();
+        let requirements = super::nut10::get_pubkeys_and_required_sigs(&secret, now)?;
+
+        if requirements.preimage_needed {
+            return Err(Error::PreimageNotSupportedInP2PK);
+        }
+
+        // Handle "anyone can spend" case (locktime passed with no refund keys)
+        if requirements.required_sigs == 0 {
+            return Ok(());
+        }
+
+        // Extract witness signatures
         let witness_signatures = match &self.witness {
             Some(witness) => witness.signatures(),
             None => None,
         };
-
         let witness_signatures = witness_signatures.ok_or(Error::SignaturesNotProvided)?;
 
-        let mut pubkeys = spending_conditions.pubkeys.clone().unwrap_or_default();
+        // Count valid signatures using relevant_pubkeys
+        let msg: &[u8] = self.secret.as_bytes();
+        let valid_sig_count = valid_signatures(
+            msg,
+            &requirements.pubkeys,
+            &witness_signatures
+                .iter()
+                .map(|s| Signature::from_str(s))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
 
-        if secret.kind().eq(&Kind::P2PK) {
-            pubkeys.push(PublicKey::from_str(secret.secret_data().data())?);
+        // Check if we have enough valid signatures
+        if valid_sig_count >= requirements.required_sigs {
+            Ok(())
+        } else {
+            Err(Error::SpendConditionsNotMet)
         }
-
-        for signature in witness_signatures.iter() {
-            for v in &pubkeys {
-                let sig = Signature::from_str(signature)?;
-
-                if v.verify(msg, &sig).is_ok() {
-                    // If the pubkey is already verified, return a duplicate signature error
-                    if !verified_pubkeys.insert(*v) {
-                        return Err(Error::DuplicateSignature);
-                    }
-                } else {
-                    tracing::debug!(
-                        "Could not verify signature: {sig} on message: {}",
-                        self.secret.to_string()
-                    )
-                }
-            }
-        }
-
-        let valid_sigs = verified_pubkeys.len() as u64;
-
-        if valid_sigs >= spending_conditions.num_sigs.unwrap_or(1) {
-            return Ok(());
-        }
-
-        if let (Some(locktime), Some(refund_keys)) = (
-            spending_conditions.locktime,
-            spending_conditions.refund_keys,
-        ) {
-            let needed_refund_sigs = spending_conditions.num_sigs_refund.unwrap_or(1) as usize;
-
-            let mut valid_pubkeys = HashSet::new();
-
-            // If lock time has passed check if refund witness signature is valid
-            if locktime.lt(&unix_time()) {
-                for s in witness_signatures.iter() {
-                    for v in &refund_keys {
-                        let sig = Signature::from_str(s).map_err(|_| Error::InvalidSignature)?;
-
-                        if v.verify(msg, &sig).is_ok() {
-                            if !valid_pubkeys.insert(v) {
-                                return Err(Error::DuplicateSignature);
-                            }
-
-                            if valid_pubkeys.len() >= needed_refund_sigs {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(Error::SpendConditionsNotMet)
     }
 }
 
@@ -317,7 +304,15 @@ pub enum SpendingConditions {
 impl SpendingConditions {
     /// New HTLC [SpendingConditions]
     pub fn new_htlc(preimage: String, conditions: Option<Conditions>) -> Result<Self, Error> {
-        let htlc = Sha256Hash::hash(&hex::decode(preimage)?);
+        const MAX_PREIMAGE_BYTES: usize = 32;
+
+        let preimage_bytes = hex::decode(preimage)?;
+
+        if preimage_bytes.len() != MAX_PREIMAGE_BYTES {
+            return Err(Error::PreimageTooLarge);
+        }
+
+        let htlc = Sha256Hash::hash(&preimage_bytes);
 
         Ok(Self::HTLCConditions {
             data: htlc,
@@ -367,8 +362,9 @@ impl SpendingConditions {
                 if let Some(conditions) = conditions {
                     pubkeys.extend(conditions.pubkeys.clone().unwrap_or_default());
                 }
-
-                Some(pubkeys)
+                // Remove duplicates
+                let unique_pubkeys: HashSet<_> = pubkeys.into_iter().collect();
+                Some(unique_pubkeys.into_iter().collect())
             }
             Self::HTLCConditions { conditions, .. } => conditions.clone().and_then(|c| c.pubkeys),
         }
@@ -500,7 +496,7 @@ impl From<Conditions> for Vec<Vec<String>> {
             refund_keys,
             num_sigs,
             sig_flag,
-            num_sigs_refund: _,
+            num_sigs_refund,
         } = conditions;
 
         let mut tags = Vec::new();
@@ -520,6 +516,11 @@ impl From<Conditions> for Vec<Vec<String>> {
         if let Some(refund_keys) = refund_keys {
             tags.push(Tag::Refund(refund_keys).as_vec())
         }
+
+        if let Some(num_sigs_refund) = num_sigs_refund {
+            tags.push(Tag::NSigsRefund(num_sigs_refund).as_vec())
+        }
+
         tags.push(Tag::SigFlag(sig_flag).as_vec());
         tags
     }
@@ -575,13 +576,22 @@ impl TryFrom<Vec<Vec<String>>> for Conditions {
             None
         };
 
+        let num_sigs_refund = if let Some(tag) = tags.get(&TagKind::NSigsRefund) {
+            match tag {
+                Tag::NSigsRefund(num_sigs) => Some(*num_sigs),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Conditions {
             locktime,
             pubkeys,
             refund_keys,
             num_sigs,
             sig_flag,
-            num_sigs_refund: None,
+            num_sigs_refund,
         })
     }
 }
@@ -617,7 +627,7 @@ impl fmt::Display for TagKind {
             Self::Refund => write!(f, "refund"),
             Self::Pubkeys => write!(f, "pubkeys"),
             Self::NSigsRefund => write!(f, "n_sigs_refund"),
-            Self::Custom(kind) => write!(f, "{kind}"),
+            Self::Custom(c) => write!(f, "{c}"),
         }
     }
 }
@@ -633,6 +643,7 @@ where
             "locktime" => Self::Locktime,
             "refund" => Self::Refund,
             "pubkeys" => Self::Pubkeys,
+            "n_sigs_refund" => Self::NSigsRefund,
             t => Self::Custom(t.to_owned()),
         }
     }
@@ -739,6 +750,10 @@ pub enum Tag {
     Refund(Vec<PublicKey>),
     /// Pubkeys [`Tag`]
     PubKeys(Vec<PublicKey>),
+    /// Number of Sigs refund [`Tag`]
+    NSigsRefund(u64),
+    /// Custom tag
+    Custom(String, Vec<String>),
 }
 
 impl Tag {
@@ -750,6 +765,8 @@ impl Tag {
             Self::LockTime(_) => TagKind::Locktime,
             Self::Refund(_) => TagKind::Refund,
             Self::PubKeys(_) => TagKind::Pubkeys,
+            Self::NSigsRefund(_) => TagKind::NSigsRefund,
+            Self::Custom(tag, _) => TagKind::Custom(tag.to_string()),
         }
     }
 
@@ -790,7 +807,16 @@ where
 
                 Ok(Self::PubKeys(pubkeys))
             }
-            _ => Err(Error::UnknownTag),
+            TagKind::NSigsRefund => Ok(Tag::NSigsRefund(tag[1].as_ref().parse()?)),
+            TagKind::Custom(name) => {
+                let tags = tag
+                    .iter()
+                    .skip(1)
+                    .map(|p| p.as_ref().to_string())
+                    .collect::<Vec<String>>();
+
+                Ok(Self::Custom(name, tags))
+            }
         }
     }
 }
@@ -816,7 +842,78 @@ impl From<Tag> for Vec<String> {
                 }
                 tag
             }
+            Tag::NSigsRefund(num_sigs) => {
+                vec![TagKind::NSigsRefund.to_string(), num_sigs.to_string()]
+            }
+            Tag::Custom(name, c) => {
+                let mut tag = vec![name];
+
+                for t in c {
+                    tag.push(t);
+                }
+
+                tag
+            }
         }
+    }
+}
+
+impl SwapRequest {
+    /// Sign swap request with SIG_ALL
+    pub fn sign_sig_all(&mut self, secret_key: SecretKey) -> Result<(), Error> {
+        // Get message to sign
+        let msg = self.sig_all_msg_to_sign();
+        let signature = secret_key.sign(msg.as_bytes())?;
+
+        // Add signature to first input witness
+        let first_input = self
+            .inputs_mut()
+            .first_mut()
+            .ok_or(Error::IncorrectSecretKind)?;
+
+        match first_input.witness.as_mut() {
+            Some(witness) => {
+                witness.add_signatures(vec![signature.to_string()]);
+            }
+            None => {
+                let mut p2pk_witness = Witness::P2PKWitness(P2PKWitness::default());
+                p2pk_witness.add_signatures(vec![signature.to_string()]);
+                first_input.witness = Some(p2pk_witness);
+            }
+        };
+
+        Ok(())
+    }
+}
+
+impl<Q> MeltRequest<Q>
+where
+    Q: std::fmt::Display + Serialize + DeserializeOwned,
+{
+    /// Sign melt request with SIG_ALL
+    pub fn sign_sig_all(&mut self, secret_key: SecretKey) -> Result<(), Error> {
+        // Get message to sign
+        let msg = self.sig_all_msg_to_sign();
+        let signature = secret_key.sign(msg.as_bytes())?;
+
+        // Add signature to first input witness
+        let first_input = self
+            .inputs_mut()
+            .first_mut()
+            .ok_or(Error::SpendConditionsNotMet)?;
+
+        match first_input.witness.as_mut() {
+            Some(witness) => {
+                witness.add_signatures(vec![signature.to_string()]);
+            }
+            None => {
+                let mut p2pk_witness = Witness::P2PKWitness(P2PKWitness::default());
+                p2pk_witness.add_signatures(vec![signature.to_string()]);
+                first_input.witness = Some(p2pk_witness);
+            }
+        };
+
+        Ok(())
     }
 }
 
@@ -845,14 +942,18 @@ impl<'de> Deserialize<'de> for Tag {
     }
 }
 
+#[cfg(feature = "mint")]
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
+    use uuid::Uuid;
+
     use super::*;
     use crate::nuts::Id;
+    use crate::quote_id::QuoteId;
     use crate::secret::Secret;
-    use crate::Amount;
+    use crate::{Amount, BlindedMessage};
 
     #[test]
     fn test_secret_ser() {
@@ -995,11 +1096,1171 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_signatures_counting() {
-        let proof: Proof = serde_json::from_str(
-            r#"{"amount":1,"id":"009a1f293253e41e","secret":"[\"P2PK\",{\"nonce\":\"e434a9efbc5f65d144a620e368c9a6dc12c719d0ebc57e0c74f7341864dc449a\",\"data\":\"02a60c27104cf6023581e790970fc33994a320abe36e7ceed16771b0f8d76f0666\",\"tags\":[[\"pubkeys\",\"039c6a20a6ba354b7bb92eb9750716c1098063006362a1fa2afca7421f262d45c5\",\"0203eb2f7cd72a4f725d3327216365d2df18bb4bbc810522fd973c9af987e9b05b\"],[\"locktime\",\"1744876528\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_INPUTS\"]]}]","C":"02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904","witness":"{\"signatures\":[\"3e9ff9e55c9eccb9e5aa0b6c62d54500b40d0eebadb06efcc8e76f3ce38e0923f956ec1bccb9080db96a17c1e98a1b857abfd1a56bb25670037cea3db1f73d81\",\"c5e29c38e60c4db720cf3f78e590358cf1291a06b9eadf77c1108ae84d533520c2707ffda224eb6a63fddaee9abd5ecf8f2cd263d2556950550e3061a5511f65\"]}"}"#,
-        ).unwrap();
+    fn sig_with_non_refund_keys_after_locktime() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+
+        let signing_key_two =
+            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+
+        let signing_key_three =
+            SecretKey::from_str("7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f")
+                .unwrap();
+        let v_key: PublicKey = secret_key.public_key();
+        let v_key_two: PublicKey = signing_key_two.public_key();
+        let v_key_three: PublicKey = signing_key_three.public_key();
+
+        let conditions = Conditions {
+            locktime: Some(21),
+            pubkeys: Some(vec![v_key_three]),
+            refund_keys: Some(vec![v_key, v_key_two]),
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: Some(2),
+        };
+
+        let secret: Secret = Nut10Secret::new(Kind::P2PK, v_key.to_string(), Some(conditions))
+            .try_into()
+            .unwrap();
+
+        let mut proof = Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::ZERO,
+            secret,
+            c: PublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: Some(Witness::P2PKWitness(P2PKWitness { signatures: vec![] })),
+            dleq: None,
+        };
+
+        proof.sign_p2pk(signing_key_three.clone()).unwrap();
 
         assert!(proof.verify_p2pk().is_err());
+
+        proof.witness = None;
+
+        proof.sign_p2pk(secret_key).unwrap();
+        assert!(proof.verify_p2pk().is_err());
+        proof.sign_p2pk(signing_key_two).unwrap();
+
+        assert!(proof.verify_p2pk().is_ok());
+    }
+
+    // Helper functions for melt request tests
+    fn create_test_proof(secret: Secret, pubkey: PublicKey, id: &str) -> Proof {
+        Proof {
+            keyset_id: Id::from_str(id).unwrap(),
+            amount: Amount::ZERO,
+            secret,
+            c: pubkey,
+            witness: None,
+            dleq: None,
+        }
+    }
+
+    fn create_test_secret(pubkey: PublicKey, conditions: Conditions) -> Secret {
+        Nut10Secret::new(Kind::P2PK, pubkey.to_string(), Some(conditions))
+            .try_into()
+            .unwrap()
+    }
+
+    fn create_test_blinded_msg(pubkey: PublicKey) -> BlindedMessage {
+        BlindedMessage {
+            amount: Amount::ZERO,
+            blinded_secret: pubkey,
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            witness: None,
+        }
+    }
+
+    #[test]
+    fn test_melt_sig_all_basic_signing() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        // Create conditions with SIG_ALL
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof = create_test_proof(secret, pubkey, "009a1f293253e41e");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+
+        // Create melt request
+        let mut melt = MeltRequest::new(
+            QuoteId::UUID(Uuid::new_v4()),
+            vec![proof],
+            Some(vec![blinded_msg]),
+        );
+
+        // Before signing, should fail verification
+        assert!(
+            melt.verify_spending_conditions().is_err(),
+            "Unsigned melt request should fail verification"
+        );
+
+        // Sign the request
+        assert!(
+            melt.sign_sig_all(secret_key).is_ok(),
+            "Signing should succeed"
+        );
+
+        // After signing, should pass verification
+        assert!(
+            melt.verify_spending_conditions().is_ok(),
+            "Signed melt request should pass verification"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_unauthorized_key() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        // Create conditions with explicit authorized pubkey
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            pubkeys: Some(vec![pubkey]),
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof = create_test_proof(secret, pubkey, "009a1f293253e41e");
+
+        let mut melt = MeltRequest::new(Uuid::new_v4(), vec![proof], None);
+
+        // Sign with unauthorized key
+        let unauthorized_key =
+            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        melt.sign_sig_all(unauthorized_key).unwrap();
+
+        // Verification should fail (unauthorized signature)
+        assert!(
+            melt.verify_spending_conditions().is_err(),
+            "Verification should fail with unauthorized key signature"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_wrong_flag() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        // Create conditions with SIG_INPUTS instead of SIG_ALL
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigInputs,
+            pubkeys: Some(vec![pubkey]),
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof = create_test_proof(secret, pubkey, "009a1f293253e41e");
+
+        let mut melt = MeltRequest::new(Uuid::new_v4(), vec![proof], None);
+
+        // Signing
+        melt.sign_sig_all(secret_key).unwrap();
+
+        // Verification should fail (wrong flag - expected SIG_ALL)
+        assert!(
+            melt.verify_spending_conditions().is_err(),
+            "Verification should fail with SIG_INPUTS flag when expecting SIG_ALL"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_multiple_inputs() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        // Create conditions
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+
+        // Create two proofs with same secret
+        let proof1 = create_test_proof(secret.clone(), pubkey, "009a1f293253e41e");
+        let proof2 = create_test_proof(secret, pubkey, "009a1f293253e41f");
+
+        let mut melt = MeltRequest::new(Uuid::new_v4(), vec![proof1, proof2], None);
+
+        // Signing should work with multiple matching inputs
+        assert!(
+            melt.sign_sig_all(secret_key).is_ok(),
+            "Signing with multiple matching inputs should succeed"
+        );
+        assert!(
+            melt.verify_spending_conditions().is_ok(),
+            "Verification should succeed with multiple matching inputs"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_mismatched_inputs() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        // Create first secret and proof
+        let conditions1 = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+        let secret1 = create_test_secret(pubkey, conditions1.clone());
+        let proof1 = create_test_proof(secret1, pubkey, "009a1f293253e41e");
+
+        // Create second secret with different data
+        let conditions2 = conditions1.clone();
+        let secret2 = Nut10Secret::new(
+            Kind::P2PK,
+            "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            Some(conditions2),
+        )
+        .try_into()
+        .unwrap();
+        let proof2 = create_test_proof(secret2, pubkey, "009a1f293253e41f");
+
+        let mut melt = MeltRequest::new(Uuid::new_v4(), vec![proof1, proof2], None);
+
+        // Signing should succeed (no validation during signing)
+        melt.sign_sig_all(secret_key).unwrap();
+
+        // Verification should fail (catches mismatched inputs)
+        assert!(
+            melt.verify_spending_conditions().is_err(),
+            "Verification should fail with mismatched input secrets"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_multiple_signatures() {
+        let secret_key1 =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey1 = secret_key1.public_key();
+
+        let secret_key2 =
+            SecretKey::from_str("7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f")
+                .unwrap();
+        let pubkey2 = secret_key2.public_key();
+
+        // Create conditions requiring 2 signatures
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            num_sigs: Some(2),
+            pubkeys: Some(vec![pubkey2]),
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey1, conditions);
+        let proof = create_test_proof(secret, pubkey1, "009a1f293253e41e");
+
+        let mut melt = MeltRequest::new(
+            Uuid::new_v4(),
+            vec![proof],
+            Some(vec![create_test_blinded_msg(
+                SecretKey::generate().public_key(),
+            )]),
+        );
+
+        // First signature
+        assert!(
+            melt.sign_sig_all(secret_key1).is_ok(),
+            "First signature should succeed"
+        );
+        assert!(
+            melt.verify_spending_conditions().is_err(),
+            "Single signature should not verify when two required"
+        );
+
+        // Second signature
+        assert!(
+            melt.sign_sig_all(secret_key2).is_ok(),
+            "Second signature should succeed"
+        );
+
+        assert!(
+            melt.verify_spending_conditions().is_ok(),
+            "Both signatures should verify successfully"
+        );
+    }
+
+    #[test]
+    fn test_melt_sig_all_message_components() {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            pubkeys: Some(vec![pubkey]),
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof = create_test_proof(secret.clone(), pubkey, "009a1f293253e41e");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+        let quote_id = Uuid::new_v4();
+
+        let melt = MeltRequest::new(quote_id, vec![proof], Some(vec![blinded_msg.clone()]));
+
+        // Get message to sign
+        let msg = melt.sig_all_msg_to_sign();
+
+        // Verify all components are present in the message
+        assert!(
+            msg.contains(&secret.to_string()),
+            "Message should contain secret"
+        );
+        assert!(
+            msg.contains(&blinded_msg.blinded_secret.to_hex()),
+            "Message should contain blinded message in hex format"
+        );
+        assert!(
+            msg.contains(&quote_id.to_string()),
+            "Message should contain quote ID"
+        );
+    }
+
+    // "SIG_ALL Test Vectors", starting with swaps : https://github.com/cashubtc/nuts/blob/5b050c7960607cca0481c28517cab5cc091b5d2e/tests/11-test.md#sig_all-test-vectors
+    #[test]
+    fn test_sig_all_swap_single_sig() {
+        // Valid SwapRequest with SIG_ALL signature
+        let valid_swap = r#"{
+          "inputs": [
+            {
+              "amount": 2,
+              "id": "00bfa73302d12ffd",
+              "secret": "[\"P2PK\",{\"nonce\":\"c7f280eb55c1e8564e03db06973e94bc9b666d9e1ca42ad278408fe625950303\",\"data\":\"030d8acedfe072c9fa449a1efe0817157403fbec460d8e79f957966056e5dd76c1\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+              "C": "02c97ee3d1db41cf0a3ddb601724be8711a032950811bf326f8219c50c4808d3cd",
+              "witness": "{\"signatures\":[\"ce017ca25b1b97df2f72e4b49f69ac26a240ce14b3690a8fe619d41ccc42d3c1282e073f85acd36dc50011638906f35b56615f24e4d03e8effe8257f6a808538\"]}"
+            }
+          ],
+          "outputs": [
+            {
+              "amount": 2,
+              "id": "00bfa73302d12ffd",
+              "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+            }
+          ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        // Verify the message format
+        let msg_to_sign = valid_swap.sig_all_msg_to_sign();
+        assert_eq!(
+            msg_to_sign,
+            "[\"P2PK\",{\"nonce\":\"c7f280eb55c1e8564e03db06973e94bc9b666d9e1ca42ad278408fe625950303\",\"data\":\"030d8acedfe072c9fa449a1efe0817157403fbec460d8e79f957966056e5dd76c1\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]02c97ee3d1db41cf0a3ddb601724be8711a032950811bf326f8219c50c4808d3cd2038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+        );
+
+        // Verify the SHA256 hash of the message
+        use bitcoin::hashes::{sha256, Hash};
+        let msg_hash = sha256::Hash::hash(msg_to_sign.as_bytes());
+        assert_eq!(
+            msg_hash.to_string(),
+            "de7f9e3ca0fcc5ed3258fcf83dbf1be7fa78a5ed6da7bf2aa60d61e9dc6eb09a"
+        );
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid SIG_ALL swap request should verify"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_swap_single_sig_2() {
+        // The following is a SwapRequest with a valid sig_all signature.
+        let valid_swap = r#"{
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"c7f280eb55c1e8564e03db06973e94bc9b666d9e1ca42ad278408fe625950303\",\"data\":\"030d8acedfe072c9fa449a1efe0817157403fbec460d8e79f957966056e5dd76c1\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "02c97ee3d1db41cf0a3ddb601724be8711a032950811bf326f8219c50c4808d3cd",
+                  "witness": "{\"signatures\":[\"ce017ca25b1b97df2f72e4b49f69ac26a240ce14b3690a8fe619d41ccc42d3c1282e073f85acd36dc50011638906f35b56615f24e4d03e8effe8257f6a808538\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid SIG_ALL swap request should verify"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_multiple_secrets() {
+        // The following is a SwapRequest that is invalid as there are multiple secrets.
+        let invalid_swap = r#"{
+                  "inputs": [
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"fa6dd3fac9086c153878dec90b9e37163d38ff2ecf8b37db6470e9d185abbbae\",\"data\":\"033b42b04e659fed13b669f8b16cdaffc3ee5738608810cf97a7631d09bd01399d\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "024d232312bab25af2e73f41d56864d378edca9109ae8f76e1030e02e585847786",
+                  "witness": "{\"signatures\":[\"27b4d260a1186e3b62a26c0d14ffeab3b9f7c3889e78707b8fd3836b473a00601afbd53a2288ad20a624a8bbe3344453215ea075fc0ce479dd8666fd3d9162cc\"]}"
+                },
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"4007b21fc5f5b1d4920bc0a08b158d98fd0fb2b0b0262b57ff53c6c5d6c2ae8c\",\"data\":\"033b42b04e659fed13b669f8b16cdaffc3ee5738608810cf97a7631d09bd01399d\",\"tags\":[[\"locktime\",\"122222222222222\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "02417400f2af09772219c831501afcbab4efb3b2e75175635d5474069608deb641"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                },
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "03afe7c87e32d436f0957f1d70a2bca025822a84a8623e3a33aed0a167016e0ca5"
+                },
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "02c0d4fce02a7a0f09e3f1bca952db910b17e81a7ebcbce62cd8dcfb127d21e37b"
+                }
+              ]
+}"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalid_swap).unwrap();
+
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid swap with multiple secrets shouldn't be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_multiple_signatures_provided() {
+        // The following is a SwapRequest multiple valid signatures are provided and required.
+        let valid_swap = r#"{
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"04bfd885fc982d553711092d037fdceb7320fd8f96b0d4fd6d31a65b83b94272\",\"data\":\"0275e78025b558dbe6cb8fdd032a2e7613ca14fda5c1f4c4e3427f5077a7bd90e4\",\"tags\":[[\"pubkeys\",\"035163650bbd5ed4be7693f40f340346ba548b941074e9138b67ef6c42755f3449\",\"02817d22a8edc44c4141e192995a7976647c335092199f9e076a170c7336e2f5cc\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "03866a09946562482c576ca989d06371e412b221890804c7da8887d321380755be",
+                  "witness": "{\"signatures\":[\"be1d72c5ca16a93c5a34f25ec63ce632ddc3176787dac363321af3fd0f55d1927e07451bc451ffe5c682d76688ea9925d7977dffbb15bd79763b527f474734b0\",\"669d6d10d7ed35395009f222f6c7bdc28a378a1ebb72ee43117be5754648501da3bedf2fd6ff0c7849ac92683538c60af0af504102e40f2d8daca8e08b1ca16b\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid swap with multiple signatures should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_mixed_pubkeys_and_refund() {
+        // The following is an invalid SwapRequest with pubkeys and refund mixed.
+        let invalid_swap = r#"{
+                      "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"3e9253419a11f0a541dd6baeddecf8356fc864b5d061f12f05632bc3aee6b5c4\",\"data\":\"0343cca0e48ce9e3fdcddba4637ff8cdbf6f5ed9cfdf1873e63827e760f0ed4db5\",\"tags\":[[\"pubkeys\",\"0235e0a719f8b046cee90f55a59b1cdd6ca75ce23e49cbcd82c9e5b7310e21ebcd\",\"020443f98b356e021bae82bdfc05ff433cab21e27fca9ab7b0995aedb2e7aabc43\"],[\"locktime\",\"100\"],[\"n_sigs\",\"2\"],[\"refund\",\"026b432e62b041bf9cdae534203739c73fa506c9a2d6aa58a52bc601a1dec421e1\",\"02e3494a2e07e7f6e7d4567e0da7a563592bff1e121df2383667f15b83e9168a9e\"],[\"n_sigs_refund\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "026c12ee3bffa5c617debcf823bf1af6a9b47145b699f2737bba3394f0893eb869",
+                  "witness": "{\"signatures\":[\"bfe884145ce6512331324321c3946dfd812428a53656b108b59d26559a186ba2ab45e5be9ce94e2dff0d09078e25ccb82d06a8b3a63cd3dc67065b8f77292776\",\"236e5cc9c30f85a893a29a4302e41e6f2015caef4229f28fa65e2f5c9d55515cc9a1852093a81a5095055d85fd55bf4da124e55354b56e0a39e83b58b0afc197\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                },
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "03afe7c87e32d436f0957f1d70a2bca025822a84a8623e3a33aed0a167016e0ca5"
+                }
+              ]
+}"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalid_swap).unwrap();
+
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid swap with mixed refunds and pubkeys shouldn't be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_locktime_passed_with_valid_refund_key_sigs() {
+        // The following is a SwapRequest with locktime passed and refund keys signatures are valid
+        let valid_swap = r#"{
+                      "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"9ea35553beb18d553d0a53120d0175a0991ca6109370338406eed007b26eacd1\",\"data\":\"02af21e09300af92e7b48c48afdb12e22933738cfb9bba67b27c00c679aae3ec25\",\"tags\":[[\"locktime\",\"1\"],[\"refund\",\"02637c19143c58b2c58bd378400a7b82bdc91d6dedaeb803b28640ef7d28a887ac\",\"0345c7fdf7ec7c8e746cca264bf27509eb4edb9ac421f8fbfab1dec64945a4d797\"],[\"n_sigs_refund\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "03dd83536fbbcbb74ccb3c87147df26753fd499cc2c095f74367fff0fb459c312e",
+                  "witness": "{\"signatures\":[\"23b58ef28cd22f3dff421121240ddd621deee83a3bc229fd67019c2e338d91e2c61577e081e1375dbab369307bba265e887857110ca3b4bd949211a0a298805f\",\"7e75948ef1513564fdcecfcbd389deac67c730f7004f8631ba90c0844d3e8c0cf470b656306877df5141f65fd3b7e85445a8452c3323ab273e6d0d44843817ed\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid post-locktime swap with refund keys should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_htlc_and_pubkey() {
+        // The following is a valid `SwapRequest` with an HTLC also locked to a public key
+        let valid_swap = r#"{
+                      "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"HTLC\",{\"nonce\":\"d730dd70cd7ec6e687829857de8e70aab2b970712f4dbe288343eca20e63c28c\",\"data\":\"ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5\",\"tags\":[[\"pubkeys\",\"0350cda8a1d5257dbd6ba8401a9a27384b9ab699e636e986101172167799469b14\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "03ff6567e2e6c31db5cb7189dab2b5121930086791c93899e4eff3dda61cb57273",
+                  "witness": "{\"preimage\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"signatures\":[\"a4c00a9ad07f9936e404494fda99a9b935c82d7c053173b304b8663124c81d4b00f64a225f5acf41043ca52b06382722bd04ded0fbeb0fcc404eed3b24778b88\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid swap with htlc and pubkey should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_enforce_locktime_with_only_refund_signed() {
+        // The following is an invalid SwapRequest with an HTLC also locked to a public key, locktime and refund key. locktime is not expired but proof is signed with refund key.
+        let invalid_swap = r#"{
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"HTLC\",{\"nonce\":\"512c4045f12fdfd6f55059669c189e040c37c1ce2f8be104ed6aec296acce4e9\",\"data\":\"ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5\",\"tags\":[[\"pubkeys\",\"03ba83defd31c63f8841d188f0d41b5bb3af1bb3c08d0ba46f8f1d26a4d45e8cad\"],[\"locktime\",\"4854185133\"],[\"refund\",\"032f1008a79c722e93a1b4b853f85f38283f9ef74ee4c5c91293eb1cc3c5e46e34\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "02207abeff828146f1fc3909c74613d5605bd057f16791994b3c91f045b39a6939",
+                  "witness": "{\"preimage\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"signatures\":[\"7816d57871bde5be2e4281065dbe5b15f641d8f1ed9437a3ae556464d6f9b8a0a2e6660337a915f2c26dce1453a416daf682b8fb593b67a0750fce071e0759b9\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                },
+                {
+                  "amount": 1,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "03afe7c87e32d436f0957f1d70a2bca025822a84a8623e3a33aed0a167016e0ca5"
+                }
+              ]
+}"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalid_swap).unwrap();
+
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid swap with pre-locktime conditions not met shouldn't be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_htlc_post_locktime() {
+        // The following is a valid SwapRequest with a multisig HTLC also locked to locktime and refund keys.
+        let valid_swap = r#"{
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"HTLC\",{\"nonce\":\"c9b0fabb8007c0db4bef64d5d128cdcf3c79e8bb780c3294adf4c88e96c32647\",\"data\":\"ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5\",\"tags\":[[\"pubkeys\",\"039e6ec7e922abb4162235b3a42965eb11510b07b7461f6b1a17478b1c9c64d100\"],[\"locktime\",\"1\"],[\"refund\",\"02ce1bbd2c9a4be8029c9a6435ad601c45677f5cde81f8a7f0ed535e0039d0eb6c\",\"03c43c00ff57f63cfa9e732f0520c342123e21331d0121139f1b636921eeec095f\"],[\"n_sigs_refund\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "0344b6f1471cf18a8cbae0e624018c816be5e3a9b04dcb7689f64173c1ae90a3a5",
+                  "witness": "{\"preimage\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"signatures\":[\"98e21672d409cc782c720f203d8284f0af0c8713f18167499f9f101b7050c3e657fb0e57478ebd8bd561c31aa6c30f4cd20ec38c73f5755b7b4ddee693bca5a5\",\"693f40129dbf905ed9c8008081c694f72a36de354f9f4fa7a61b389cf781f62a0ae0586612fb2eb504faaf897fefb6742309186117f4743bcebcb8e350e975e2\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_swap: SwapRequest = serde_json::from_str(valid_swap).unwrap();
+
+        assert!(
+            valid_swap.verify_spending_conditions().is_ok(),
+            "Valid post-locktime swap with htlc should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_swap_mismatched_inputs() {
+        // Invalid SwapRequest - mismatched inputs with SIG_ALL
+        let invalid_swap = r#"{
+            "inputs": [
+        {
+          "amount": 1,
+          "id": "00bfa73302d12ffd",
+          "secret": "[\"P2PK\",{\"nonce\":\"e2a221fe361f19d95c5c3312ccff3ffa075b4fe37beec99de85a6ee70568385b\",\"data\":\"03dad7f9c588f4cbb55c2e1b7b802fa2bbc63a614d9e9ecdf56a8e7ee8ca65be86\",\"tags\":[[\"pubkeys\",\"025f2af63fd65ca97c3bde4070549683e72769d28def2f1cd3d63576cd9c2ffa6c\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+          "C": "02a79c09b0605f4e7a21976b511cc7be01cdaeac54b29645258c84f2e74bff13f6",
+          "witness": "{\"signatures\":[\"b42c7af7e98ca4e3bba8b73702120970286196340b340c21299676dbc7b10cafaa7baeb243affc01afce3218616cf8b3f6b4baaf4414fedb31b0c6653912f769\",\"17781910e2d806cae464f8a692929ee31124c0cd7eaf1e0d94292c6cbc122da09076b649080b8de9201f87d83b99fe04e33d701817eb287d1cdd9c4d0410e625\"]}"
+        },
+        {
+          "amount": 2,
+          "id": "00bfa73302d12ffd",
+          "secret": "[\"P2PK\",{\"nonce\":\"973c78b5e84c0986209dc14ba57682baf38fa4c1ea60c4c5f6834779a1a13e6d\",\"data\":\"02685df03c777837bc7155bd2d0d8e98eede7e956a4cd8a9edac84532584e68e0f\",\"tags\":[[\"pubkeys\",\"025f2af63fd65ca97c3bde4070549683e72769d28def2f1cd3d63576cd9c2ffa6c\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+          "C": "02be48c564cf6a7b4d09fbaf3a78a153a79f687ac4623e48ce1788effc3fb1e024"
+        }
+      ],
+      "outputs": [
+        {
+          "amount": 1,
+          "id": "00bfa73302d12ffd",
+          "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+        },
+        {
+          "amount": 1,
+          "id": "00bfa73302d12ffd",
+          "B_": "03afe7c87e32d436f0957f1d70a2bca025822a84a8623e3a33aed0a167016e0ca5"
+        },
+        {
+          "amount": 1,
+          "id": "00bfa73302d12ffd",
+          "B_": "02c0d4fce02a7a0f09e3f1bca952db910b17e81a7ebcbce62cd8dcfb127d21e37b"
+        }
+      ]
+    }"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalid_swap).unwrap();
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid SIG_ALL swap request should fail verification"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_mixed_pubkeys_and_refund_pubkeys() {
+        // SwapRequest with mixed up signatures from pubkey and refund_pubkeys
+        let invalidsig_all_swap = r#"{
+  "inputs": [
+    {
+      "amount": 2,
+      "id": "00bfa73302d12ffd",
+      "secret": "[\"P2PK\",{\"nonce\":\"cc93775c74df53d7c97eb37f72018d166a45ce4f4c65f11c4014b19acd02bd2f\",\"data\":\"02f515ab63e973e0dadfc284bf2ef330b01aa99c3ff775d88272f9c17afa25568c\",\"tags\":[[\"pubkeys\",\"026925e5bb547a3ec6b2d9b8934e23b882f54f89b2a9f45300bf81fd1b311d9c97\"],[\"n_sigs\",\"2\"],[\"refund\",\"03c8cd46b7e6592c41df38bc54dce2555586e7adbb15cc80a02d1a05829677286d\"],[\"n_sigs_refund\",\"1\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+      "C": "03f6d40d0ab11f4082ee7e977534a6fcd151394d647cde4ab122157e6d755410fd",
+      "witness": "{\"signatures\":[\"a9f61c2b7161a50839bf7f3e2e1cb9bd7bdacd2ce62c0d458a5969db44646dad409a282241b412e8b191cc7432bcfebf16ad72339a9fb966ca71c8bd971662cc\",\"aa778ec15fe9408e1989c712c823e833f33d45780b9a25555ea76004b05d495e99fd326914484f92e7e91f919ee575e79add26e9d4bbe4349d7333d7e0021af7\"]}"
+    }
+  ],
+  "outputs": [
+    {
+      "amount": 1,
+      "id": "00bfa73302d12ffd",
+      "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+    },
+    {
+      "amount": 1,
+      "id": "00bfa73302d12ffd",
+      "B_": "03afe7c87e32d436f0957f1d70a2bca025822a84a8623e3a33aed0a167016e0ca5"
+    }
+  ]
+}"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalidsig_all_swap).unwrap();
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid SIG_ALL swap request should fail verification"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_htlc_unexpired_timelock_refund_signature() {
+        // SwapRequest signed with refund_pubkey without expiration
+        let invalidsig_all_swap = r#"{
+  "inputs": [
+    {
+      "amount": 2,
+      "id": "00bfa73302d12ffd",
+      "secret": "[\"HTLC\",{\"nonce\":\"b6f0c59ea4084369d4196e1318477121c2451d59ae767060e083cb6846e6bbe0\",\"data\":\"ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5\",\"tags\":[[\"pubkeys\",\"0329fdfde4becf9ff871129653ff6464bb2c922fbcba442e6166a8b5849599604f\"],[\"locktime\",\"4854185133\"],[\"refund\",\"035fcf4a5393e4bdef0567aa0b8a9555edba36e5fcb283f3bbce52d86a687817d3\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+      "C": "024fbbee3f3cc306a48841ba327435b64de20b8b172b98296a3e573c673d52562b",
+      "witness": "{\"preimage\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"signatures\":[\"7526819070a291f731e77acfbe9da71ddc0f748fd2a3e6c2510bc83c61daaa656df345afa3832fe7cb94352c8835a4794ad499760729c0be29417387d1fc3cd1\"]}"
+    }
+  ],
+  "outputs": [
+    {
+      "amount": 2,
+      "id": "00bfa73302d12ffd",
+      "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+    }
+  ]
+}"#;
+
+        let invalid_swap: SwapRequest = serde_json::from_str(invalidsig_all_swap).unwrap();
+        assert!(
+            invalid_swap.verify_spending_conditions().is_err(),
+            "Invalid SIG_ALL swap request should fail verification"
+        );
+    }
+
+    // Now the Melt examples at the end of 11-test.md
+    #[test]
+    fn test_sig_all_melt() {
+        // Valid MeltRequest with SIG_ALL signature
+        // Example MeltRequest:
+        let valid_melt = r#"{
+              "quote": "cF8911fzT88aEi1d-6boZZkq5lYxbUSVs-HbJxK0",
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"bbf9edf441d17097e39f5095a3313ba24d3055ab8a32f758ff41c10d45c4f3de\",\"data\":\"029116d32e7da635c8feeb9f1f4559eb3d9b42d400f9d22a64834d89cde0eb6835\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "02a9d461ff36448469dccf828fa143833ae71c689886ac51b62c8d61ddaa10028b",
+                  "witness": "{\"signatures\":[\"478224fbe715e34f78cb33451db6fcf8ab948afb8bd04ff1a952c92e562ac0f7c1cb5e61809410635be0aa94d0448f7f7959bd5762cc3802b0a00ff58b2da747\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 0,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_melt: MeltRequest<String> = serde_json::from_str(valid_melt).unwrap();
+
+        // Verify the message format
+        let msg_to_sign = valid_melt.sig_all_msg_to_sign();
+        assert_eq!(
+            msg_to_sign,
+            r#"["P2PK",{"nonce":"bbf9edf441d17097e39f5095a3313ba24d3055ab8a32f758ff41c10d45c4f3de","data":"029116d32e7da635c8feeb9f1f4559eb3d9b42d400f9d22a64834d89cde0eb6835","tags":[["sigflag","SIG_ALL"]]}]02a9d461ff36448469dccf828fa143833ae71c689886ac51b62c8d61ddaa10028b0038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39cF8911fzT88aEi1d-6boZZkq5lYxbUSVs-HbJxK0"#
+        );
+
+        // Verify the SHA256 hash of the message
+        use bitcoin::hashes::{sha256, Hash};
+        let msg_hash = sha256::Hash::hash(msg_to_sign.as_bytes());
+        assert_eq!(
+            msg_hash.to_string(),
+            "9efa1067cc7dc870f4074f695115829c3cd817a6866c3b84e9814adf3c3cf262"
+        );
+
+        assert!(
+            valid_melt.verify_spending_conditions().is_ok(),
+            "Valid SIG_ALL melt request should verify"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_valid_melt() {
+        // The following is a valid SIG_ALL MeltRequest.
+        let valid_melt = r#"{
+              "quote": "cF8911fzT88aEi1d-6boZZkq5lYxbUSVs-HbJxK0",
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"bbf9edf441d17097e39f5095a3313ba24d3055ab8a32f758ff41c10d45c4f3de\",\"data\":\"029116d32e7da635c8feeb9f1f4559eb3d9b42d400f9d22a64834d89cde0eb6835\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "02a9d461ff36448469dccf828fa143833ae71c689886ac51b62c8d61ddaa10028b",
+                  "witness": "{\"signatures\":[\"478224fbe715e34f78cb33451db6fcf8ab948afb8bd04ff1a952c92e562ac0f7c1cb5e61809410635be0aa94d0448f7f7959bd5762cc3802b0a00ff58b2da747\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 0,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_melt: MeltRequest<String> = serde_json::from_str(valid_melt).unwrap();
+
+        assert!(
+            valid_melt.verify_spending_conditions().is_ok(),
+            "Valid SIG_ALL melt request should verify"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_valid_multisig_melt() {
+        // The following is a valid multi-sig SIG_ALL MeltRequest.
+        let valid_melt = r#"{
+              "quote": "Db3qEMVwFN2tf_1JxbZp29aL5cVXpSMIwpYfyOVF",
+              "inputs": [
+                {
+                  "amount": 2,
+                  "id": "00bfa73302d12ffd",
+                  "secret": "[\"P2PK\",{\"nonce\":\"68d7822538740e4f9c9ebf5183ef6c4501c7a9bca4e509ce2e41e1d62e7b8a99\",\"data\":\"0394e841bd59aeadce16380df6174cb29c9fea83b0b65b226575e6d73cc5a1bd59\",\"tags\":[[\"pubkeys\",\"033d892d7ad2a7d53708b7a5a2af101cbcef69522bd368eacf55fcb4f1b0494058\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+                  "C": "03a70c42ec9d7192422c7f7a3ad017deda309fb4a2453fcf9357795ea706cc87a9",
+                  "witness": "{\"signatures\":[\"ed739970d003f703da2f101a51767b63858f4894468cc334be04aa3befab1617a81e3eef093441afb499974152d279e59d9582a31dc68adbc17ffc22a2516086\",\"f9efe1c70eb61e7ad8bd615c50ff850410a4135ea73ba5fd8e12a734743ad045e575e9e76ea5c52c8e7908d3ad5c0eaae93337e5c11109e52848dc328d6757a2\"]}"
+                }
+              ],
+              "outputs": [
+                {
+                  "amount": 0,
+                  "id": "00bfa73302d12ffd",
+                  "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+                }
+              ]
+}"#;
+
+        let valid_melt: MeltRequest<String> = serde_json::from_str(valid_melt).unwrap();
+
+        assert!(
+            valid_melt.verify_spending_conditions().is_ok(),
+            "Valid SIG_ALL melt request should verify"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_melt_wrong_sig() {
+        // Invalid MeltRequest - wrong signature for SIG_ALL
+        let invalid_melt = r#"{
+            "inputs": [{
+                "amount": 1,
+                "secret": "[\"P2PK\",{\"nonce\":\"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f\",\"data\":\"0249098aa8b9d2fbec49ff8598feb17b592b986e62319a4fa488a3dc36387157a7\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]",
+                "C": "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+                "id": "009a1f293253e41e",
+                "witness": "{\"signatures\":[\"3426df9730d365a9d18d79bed2f3e78e9172d7107c55306ac5ddd1b2d065893366cfa24ff3c874ebf1fc22360ba5888ddf6ff5dbcb9e5f2f5a1368f7afc64f15\"]}"
+            }],
+            "quote": "test_quote_123",
+            "outputs": null
+        }"#;
+
+        let invalid_melt: MeltRequest<String> = serde_json::from_str(invalid_melt).unwrap();
+        assert!(
+            invalid_melt.verify_spending_conditions().is_err(),
+            "Invalid SIG_ALL melt request should fail verification"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_sig_all_melt_msg_to_sign() {
+        let multisig_melt = r#"{
+  "quote": "uHwJ-f6HFAC-lU2dMw0KOu6gd5S571FXQQHioYMD",
+  "inputs": [
+    {
+      "amount": 4,
+      "id": "00bfa73302d12ffd",
+      "secret": "[\"P2PK\",{\"nonce\":\"f5c26c928fb4433131780105eac330338bb9c0af2b2fd29fad9e4f18c4a96d84\",\"data\":\"03c4840e19277822bfeecf104dcd3f38d95b33249983ac6fed755869f23484fb2a\",\"tags\":[[\"pubkeys\",\"0256dcc53d9330e0bc6e9b3d47c26287695aba9fe55cafdde6f46ef56e09582bfb\"],[\"n_sigs\",\"1\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+      "C": "02174667f98114abeb741f4964bdc88a3b86efde0afa38f791094c1e07e5df3beb",
+      "witness": "{\"signatures\":[\"abeeceba92bc7d1c514844ddb354d1e88a9776dfb55d3cdc5c289240386e401c3d983b68371ce5530e86c8fc4ff90195982a262f83fa8a5335b43e75af5f5fc7\"]}"
+    }
+  ],
+  "outputs": [
+    {
+      "amount": 0,
+      "id": "00bfa73302d12ffd",
+      "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+    }
+  ]
+}"#;
+
+        let multisig_melt: MeltRequest<String> = serde_json::from_str(multisig_melt).unwrap();
+
+        assert!(
+            multisig_melt.verify_spending_conditions().is_ok(),
+            "melt request with SIG_ALL should succeed"
+        );
+
+        let msg_to_sign = multisig_melt.sig_all_msg_to_sign();
+
+        assert_eq!(
+            msg_to_sign,
+            r#"["P2PK",{"nonce":"f5c26c928fb4433131780105eac330338bb9c0af2b2fd29fad9e4f18c4a96d84","data":"03c4840e19277822bfeecf104dcd3f38d95b33249983ac6fed755869f23484fb2a","tags":[["pubkeys","0256dcc53d9330e0bc6e9b3d47c26287695aba9fe55cafdde6f46ef56e09582bfb"],["n_sigs","1"],["sigflag","SIG_ALL"]]}]02174667f98114abeb741f4964bdc88a3b86efde0afa38f791094c1e07e5df3beb000bfa73302d12ffd038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39uHwJ-f6HFAC-lU2dMw0KOu6gd5S571FXQQHioYMD"#
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_sig_all_melt_multi_sig() {
+        // MeltRequest with multi-sig SIG_ALL requiring 2 signatures
+        let multisig_melt = r#"{
+  "quote": "wYHbJm5S1GTL28tDHoUAwcvb-31vu5kfDhnLxV9D",
+  "inputs": [
+    {
+      "amount": 4,
+      "id": "00bfa73302d12ffd",
+      "secret": "[\"P2PK\",{\"nonce\":\"1705e988054354b703bc9103472cc5646ec76ed557517410186fa827c19c444d\",\"data\":\"024c8b5ec0e560f1fc77d7872ab75dd10a00af73a8ba715b81093b800849cb21fb\",\"tags\":[[\"pubkeys\",\"028d32bc906b3724724244812c450f688c548020f5d5a8c1d6cd1075650933d1a3\"],[\"n_sigs\",\"2\"],[\"sigflag\",\"SIG_ALL\"]]}]",
+      "C": "02f2a0ff12c4dd95f2476662f1df49e5126f09a5ea1f3ce13b985db57661953072",
+      "witness": "{\"signatures\":[\"a98a2616716d7813394a54ddc82234e5c47f0ddbddb98ccd1cad25236758fa235c8ae64d9fccd15efbe0ad5eba52a3df8433e9f1c05bc50defcb9161a5bd4bc4\",\"dd418cbbb23276dab8d72632ee77de730b932a3c6e8e15bc8802cef13db0b346915fe6e04e7fae03c3b5af026e25f71a24dc05b28135f0a9b69bc6c7289b6b8d\"]}"
+    }
+  ],
+  "outputs": [
+    {
+      "amount": 0,
+      "id": "00bfa73302d12ffd",
+      "B_": "038ec853d65ae1b79b5cdbc2774150b2cb288d6d26e12958a16fb33c32d9a86c39"
+    }
+  ]
+}"#;
+
+        let multisig_melt: MeltRequest<String> = serde_json::from_str(multisig_melt).unwrap();
+        assert!(
+            multisig_melt.verify_spending_conditions().is_ok(),
+            "Multi-sig SIG_ALL melt request should verify with both signatures"
+        );
+
+        // MeltRequest with insufficient signatures for multi-sig SIG_ALL
+        let insufficient_sigs_melt = r#"{
+            "inputs": [{
+                "amount": 1,
+                "secret": "[\"P2PK\",{\"nonce\":\"859d4935c4907062a6297cf4e663e2835d90d97ecdd510745d32f6816323a41f\",\"data\":\"0249098aa8b9d2fbec49ff8598feb17b592b986e62319a4fa488a3dc36387157a7\",\"tags\":[[\"sigflag\",\"SIG_ALL\"],[\"pubkeys\",\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\",\"02142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9\"],[\"n_sigs\",\"2\"]]}]",
+                "C": "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+                "id": "009a1f293253e41e",
+                "witness": "{\"signatures\":[\"83564aca48c668f50d022a426ce0ed19d3a9bdcffeeaee0dc1e7ea7e98e9eff1840fcc821724f623468c94f72a8b0a7280fa9ef5a54a1b130ef3055217f467b3\"]}"
+            }],
+            "quote": "test_quote_123",
+            "outputs": null
+        }"#;
+
+        let insufficient_sigs_melt: MeltRequest<String> =
+            serde_json::from_str(insufficient_sigs_melt).unwrap();
+        assert!(
+            insufficient_sigs_melt.verify_spending_conditions().is_err(),
+            "Multi-sig SIG_ALL melt request should fail with insufficient signatures"
+        );
+    }
+
+    // Helper functions for tests
+    fn create_test_keys() -> (SecretKey, PublicKey) {
+        let secret_key =
+            SecretKey::from_str("99590802251e78ee1051648439eedb003dc539093a48a44e7b8f2642c909ea37")
+                .unwrap();
+        let pubkey = secret_key.public_key();
+        (secret_key, pubkey)
+    }
+
+    #[test]
+    fn test_sig_all_basic_signing_verification() {
+        let (secret_key, pubkey) = create_test_keys();
+
+        // Create basic SIG_ALL conditions
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof1 = create_test_proof(secret.clone(), pubkey, "009a1f293253e41e");
+        let proof2 = create_test_proof(secret, pubkey, "009a1f293253e41f");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+
+        // Test basic signing flow
+        let mut swap = SwapRequest::new(vec![proof1, proof2], vec![blinded_msg]);
+        assert!(
+            swap.verify_spending_conditions().is_err(),
+            "Unsigned swap should fail verification"
+        );
+
+        assert!(
+            swap.sign_sig_all(secret_key).is_ok(),
+            "Signing should succeed"
+        );
+
+        println!("{}", serde_json::to_string(&swap).unwrap());
+
+        assert!(
+            swap.verify_spending_conditions().is_ok(),
+            "Signed swap should pass verification"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_unauthorized_key() {
+        let (_secret_key, pubkey) = create_test_keys();
+
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, conditions);
+        let proof = create_test_proof(secret, pubkey, "009a1f293253e41e");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+
+        // Create unauthorized key
+        let unauthorized_key =
+            SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+
+        let mut swap = SwapRequest::new(vec![proof], vec![blinded_msg]);
+
+        // Signing should succeed (no validation)
+        swap.sign_sig_all(unauthorized_key).unwrap();
+
+        // Verification should fail (unauthorized signature)
+        assert!(
+            swap.verify_spending_conditions().is_err(),
+            "Verification should fail with unauthorized key signature"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_mismatched_secrets() {
+        let (secret_key, pubkey) = create_test_keys();
+
+        let conditions = Conditions {
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+
+        // Create first proof with original secret
+        let secret1 = create_test_secret(pubkey, conditions.clone());
+
+        // Create second proof with different secret data
+        let different_secret = Nut10Secret::new(
+            Kind::P2PK,
+            "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            Some(conditions),
+        )
+        .try_into()
+        .unwrap();
+
+        let proof1 = create_test_proof(secret1, pubkey, "009a1f293253e41e");
+        let proof2 = create_test_proof(different_secret, pubkey, "009a1f293253e41f");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+
+        let mut swap = SwapRequest::new(vec![proof1, proof2], vec![blinded_msg]);
+
+        // Signing should succeed (no validation)
+        swap.sign_sig_all(secret_key).unwrap();
+
+        // Verification should fail (mismatched secrets)
+        assert!(
+            swap.verify_spending_conditions().is_err(),
+            "Verification should fail with mismatched secrets"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_wrong_flag() {
+        let (secret_key, pubkey) = create_test_keys();
+
+        // Create conditions with SIG_INPUTS instead of SIG_ALL
+        let sig_inputs_conditions = Conditions {
+            sig_flag: SigFlag::SigInputs,
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey, sig_inputs_conditions);
+        let proof = create_test_proof(secret, pubkey, "009a1f293253e41e");
+        let blinded_msg = create_test_blinded_msg(pubkey);
+
+        let mut swap = SwapRequest::new(vec![proof], vec![blinded_msg]);
+
+        // Signing should succeed (no validation)
+        swap.sign_sig_all(secret_key).unwrap();
+
+        // Verification should fail (wrong flag - has SIG_INPUTS but sign_sig_all expects SIG_ALL)
+        assert!(
+            swap.verify_spending_conditions().is_err(),
+            "Verification should fail with SIG_INPUTS flag when sign_sig_all was used"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_multiple_signatures() {
+        let (secret_key1, pubkey1) = create_test_keys();
+        let secret_key2 =
+            SecretKey::from_str("7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f")
+                .unwrap();
+        let pubkey2 = secret_key2.public_key();
+
+        // Create conditions requiring 2 signatures
+        let conditions = Conditions {
+            num_sigs: Some(2),
+            sig_flag: SigFlag::SigAll,
+            pubkeys: Some(vec![pubkey2]),
+            ..Default::default()
+        };
+
+        let secret = create_test_secret(pubkey1, conditions);
+        let proof = create_test_proof(secret, pubkey1, "009a1f293253e41e");
+        let blinded_msg = create_test_blinded_msg(pubkey1);
+
+        let mut swap = SwapRequest::new(vec![proof], vec![blinded_msg]);
+
+        // Sign with first key
+        assert!(
+            swap.sign_sig_all(secret_key1).is_ok(),
+            "First signature should succeed"
+        );
+        assert!(
+            swap.verify_spending_conditions().is_err(),
+            "Single signature should not verify when two required"
+        );
+
+        // Sign with second key
+        assert!(
+            swap.sign_sig_all(secret_key2).is_ok(),
+            "Second signature should succeed"
+        );
+
+        assert!(
+            swap.verify_spending_conditions().is_ok(),
+            "Both signatures should verify"
+        );
     }
 }

@@ -2,15 +2,17 @@
 //!
 //! This module extends the `cashu` crate with types and functions for the CDK, using the correct
 //! expected ID types.
+use std::sync::Arc;
+
 #[cfg(feature = "mint")]
 use cashu::nut17::ws::JSON_RPC_VERSION;
 use cashu::nut17::{self};
 #[cfg(feature = "mint")]
-use cashu::NotificationPayload;
+use cashu::quote_id::QuoteId;
 #[cfg(feature = "mint")]
-use uuid::Uuid;
+use cashu::NotificationPayload;
 
-use crate::pub_sub::SubId;
+type SubId = Arc<crate::subscription::SubId>;
 
 /// Request to unsubscribe from a websocket subscription
 pub type WsUnsubscribeRequest = nut17::ws::WsUnsubscribeRequest<SubId>;
@@ -48,7 +50,7 @@ pub type NotificationInner<T> = nut17::ws::NotificationInner<T, SubId>;
 #[cfg(feature = "mint")]
 /// Converts a notification with UUID identifiers to a notification with string identifiers
 pub fn notification_uuid_to_notification_string(
-    notification: NotificationInner<Uuid>,
+    notification: NotificationInner<QuoteId>,
 ) -> NotificationInner<String> {
     nut17::ws::NotificationInner {
         sub_id: notification.sub_id,
@@ -60,13 +62,16 @@ pub fn notification_uuid_to_notification_string(
             NotificationPayload::MintQuoteBolt11Response(quote) => {
                 NotificationPayload::MintQuoteBolt11Response(quote.to_string_id())
             }
+            NotificationPayload::MintQuoteBolt12Response(quote) => {
+                NotificationPayload::MintQuoteBolt12Response(quote.to_string_id())
+            }
         },
     }
 }
 
 #[cfg(feature = "mint")]
 /// Converts a notification to a websocket message that can be sent to clients
-pub fn notification_to_ws_message(notification: NotificationInner<Uuid>) -> WsMessageOrResponse {
+pub fn notification_to_ws_message(notification: NotificationInner<QuoteId>) -> WsMessageOrResponse {
     nut17::ws::WsMessageOrResponse::Notification(nut17::ws::WsNotification {
         jsonrpc: JSON_RPC_VERSION.to_owned(),
         method: "subscribe".to_string(),

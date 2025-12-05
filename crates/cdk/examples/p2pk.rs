@@ -1,9 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use cdk::amount::SplitTarget;
 use cdk::error::Error;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, NotificationPayload, SecretKey, SpendingConditions};
-use cdk::wallet::{ReceiveOptions, SendOptions, Wallet, WalletSubscription};
+use cdk::nuts::{CurrencyUnit, SecretKey, SpendingConditions};
+use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use rand::random;
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Error> {
     let localstore = Arc::new(memory::empty().await?);
 
     // Generate a random seed for the wallet
-    let seed = random::<[u8; 32]>();
+    let seed = random::<[u8; 64]>();
 
     // Define the mint URL and currency unit
     let mint_url = "https://fake.thesimplekid.dev";
@@ -32,37 +32,22 @@ async fn main() -> Result<(), Error> {
     let amount = Amount::from(100);
 
     // Create a new wallet
-    let wallet = Wallet::new(mint_url, unit, localstore, &seed, None).unwrap();
+    let wallet = Wallet::new(mint_url, unit, localstore, seed, None).unwrap();
 
-    // Request a mint quote from the wallet
     let quote = wallet.mint_quote(amount, None).await?;
-
-    println!("Minting nuts ...");
-
-    // Subscribe to updates on the mint quote state
-    let mut subscription = wallet
-        .subscribe(WalletSubscription::Bolt11MintQuoteState(vec![quote
-            .id
-            .clone()]))
-        .await;
-
-    // Wait for the mint quote to be paid
-    while let Some(msg) = subscription.recv().await {
-        if let NotificationPayload::MintQuoteBolt11Response(response) = msg {
-            if response.state == MintQuoteState::Paid {
-                break;
-            }
-        }
-    }
+    let proofs = wallet
+        .wait_and_mint_quote(
+            quote,
+            Default::default(),
+            Default::default(),
+            Duration::from_secs(10),
+        )
+        .await?;
 
     // Mint the received amount
-    let received_proofs = wallet.mint(&quote.id, SplitTarget::default(), None).await?;
     println!(
         "Minted nuts: {:?}",
-        received_proofs
-            .into_iter()
-            .map(|p| p.amount)
-            .collect::<Vec<_>>()
+        proofs.into_iter().map(|p| p.amount).collect::<Vec<_>>()
     );
 
     // Generate a secret key for spending conditions
@@ -75,10 +60,12 @@ async fn main() -> Result<(), Error> {
     let bal = wallet.total_balance().await?;
     println!("Total balance: {}", bal);
 
+    let token_amount_to_send = Amount::from(10);
+
     // Send a token with the specified amount and spending conditions
     let prepared_send = wallet
         .prepare_send(
-            10.into(),
+            token_amount_to_send,
             SendOptions {
                 conditions: Some(spending_conditions),
                 include_fee: true,
@@ -86,8 +73,12 @@ async fn main() -> Result<(), Error> {
             },
         )
         .await?;
-    println!("Fee: {}", prepared_send.fee());
-    let token = wallet.send(prepared_send, None).await?;
+
+    let swap_fee = prepared_send.swap_fee();
+
+    println!("Fee: {}", swap_fee);
+
+    let token = prepared_send.confirm(None).await?;
 
     println!("Created token locked to pubkey: {}", secret.public_key());
     println!("{}", token);
@@ -102,6 +93,8 @@ async fn main() -> Result<(), Error> {
             },
         )
         .await?;
+
+    assert!(amount == token_amount_to_send);
 
     println!("Redeemed locked token worth: {}", u64::from(amount));
 
