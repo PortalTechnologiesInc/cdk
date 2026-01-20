@@ -5,15 +5,42 @@ services:
       dockerfile: Dockerfile
     container_name: mint
     ports:
-      - "8085:8085"
+      - "3338:3338"
     environment:
-      - CDK_MINTD_URL=https://example.com
-      - CDK_MINTD_LN_BACKEND=fakewallet
+      # Info settings
+      - CDK_MINTD_URL=http://localhost:3338
       - CDK_MINTD_LISTEN_HOST=0.0.0.0
-      - CDK_MINTD_LISTEN_PORT=8085
-      - CDK_MINTD_MNEMONIC=
-      - CDK_MINTD_DATABASE=redb
+      - CDK_MINTD_LISTEN_PORT=3338
+      # Mnemonic - REQUIRED: either set this or use CDK_MINTD_SIGNATORY_URL for remote signing
+      # Option 1: Set mnemonic directly (12, 15, 18, 21, or 24 words)
+      - CDK_MINTD_MNEMONIC=banner erase humble weasel music cloth speak crucial crumble sponsor finish concert
+      # Option 2: Use signatory URL for remote signing
+      # - CDK_MINTD_SIGNATORY_URL=http://signatory:port
+      # Option 3: Use env_file to load from .env file (recommended for secrets)
+      # Uncomment the env_file line below and create a .env file with CDK_MINTD_MNEMONIC=...
+      - CDK_MINTD_DATABASE=sqlite
       - CDK_MINTD_CACHE_BACKEND=memory
+      # Mint info
+      - CDK_MINTD_MINT_NAME=Portal Mint
+      - CDK_MINTD_MINT_DESCRIPTION=A testing Cashu mint
+      # LN backend settings
+      - CDK_MINTD_LN_BACKEND=portalwallet
+      - CDK_MINTD_LN_MAX_MINT=100000
+      - CDK_MINTD_LN_MAX_MELT=100000
+      # PortalWallet specific environment variables
+      - CDK_MINTD_PORTAL_WALLET_SUPPORTED_UNITS=single:0,multi:32
+      # Unit info JSON - matches NixOS config
+      - CDK_MINTD_PORTAL_WALLET_UNIT_INFO={"single":{"title":"Single Token","description":"A unit-only non fungible token","show_individually":true,"kind":{"Event":{"date":"01/01/1970","location":"Brescia, Italy"}}},"multi":{"title":"Multi Token","description":"A normal fungible token","show_individually":false,"kind":{"Event":{"date":"01/01/1970","location":"Brescia, Italy"}}}}
+      # Auth configuration
+      - CDK_MINTD_AUTH_STATIC_TOKEN=test-static-token-for-mint-getportal-cc
+      - CDK_MINTD_AUTH_MINT_MAX_BAT=50
+      - CDK_MINTD_AUTH_ENABLED_MINT=true
+      - CDK_MINTD_AUTH_ENABLED_MELT=true
+      - CDK_MINTD_AUTH_ENABLED_SWAP=false
+      - CDK_MINTD_AUTH_ENABLED_RESTORE=false
+      - CDK_MINTD_AUTH_ENABLED_CHECK_PROOF_STATE=false
+      # Logging
+      - RUST_LOG=debug
       # - CDK_MINTD_CACHE_REDIS_URL=redis://redis:6379 
       # - CDK_MINTD_CACHE_REDIS_KEY_PREFIX=cdk-mintd
     command: ["cdk-mintd"]

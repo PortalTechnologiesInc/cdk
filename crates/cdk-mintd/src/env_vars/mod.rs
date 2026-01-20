@@ -109,7 +109,7 @@ impl Settings {
                 self.portal_wallet = Some(
                     self.portal_wallet
                         .clone()
-                        .expect("Portal wallet configuration must be set")
+                        .unwrap_or_default()
                         .from_env(),
                 );
             }

@@ -186,7 +186,7 @@ fn default_max_delay_time() -> u64 {
 }
 
 #[cfg(feature = "portalwallet")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PortalWallet {
     pub supported_units: HashMap<CurrencyUnit, u8>,
     pub unit_info: HashMap<CurrencyUnit, UnitMetadata>,
