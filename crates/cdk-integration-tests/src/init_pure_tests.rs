@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bip39::Mnemonic;
 use cdk::amount::SplitTarget;
 use cdk::cdk_database::{self, WalletDatabase};
-use cdk::mint::{MintBuilder, MintMeltLimits};
+use cdk::mint::{MintBuilder, MintMeltLimits, UnitMetadata};
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, CurrencyUnit, Id, KeySet, KeysetResponse,
@@ -151,6 +151,10 @@ impl MintConnector for DirectMintConnection {
         let mut auth_wallet = self.auth_wallet.write().await;
 
         *auth_wallet = wallet;
+    }
+
+    async fn get_unit_metadata(&self, unit: CurrencyUnit) -> Result<Option<UnitMetadata>, Error> {
+        Ok(self.mint.get_unit_metadata(unit))
     }
 }
 
