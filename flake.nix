@@ -239,11 +239,10 @@
                 tag = if system == "x86_64-linux" then "amd64" else "arm64";
 
                 config = {
-                  Cmd = [ "${minimal-closure}/bin/cdk-mintd" "--config" "/config.toml" "--work-dir" "/data" ];
+                  Cmd = [ "${minimal-closure}/bin/cdk-mintd" "--work-dir" "/data" ];
                   WorkingDir = "/data";
                   Volumes = {
                     "/data" = { };
-                    "/config.toml" = { };
                   };
                   ExposedPorts = {
                     "3338/tcp" = { };
